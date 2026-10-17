@@ -261,10 +261,12 @@ describe("process-wide options owner", () => {
     expect(langfuse.calls).toEqual([]);
   });
 
-  test("warns once and stays off for invalid options", async () => {
+  test("warns once per process and stays off for invalid options", async () => {
     const { linking, langfuse, warnings, judge } = createLinking({
       agentPrompt: "agents/reviewer",
     });
+    linking.register({ promptLinking: { agentPrompt: "agents/reviewer" } });
+    linking.register({ promptLinking: { instructionPath: "AGENTS.md" } });
 
     expect(linking.enabled).toBe(false);
     expect(judge()).toBe(undefined);
@@ -433,6 +435,96 @@ describe("whole system part matching", () => {
     expect(await warm()).toEqual({
       name: "agents/reviewer",
       status: "unavailable",
+    });
+  });
+});
+
+describe("version config constraints", () => {
+  const BODY_VALID = "A version with a valid constraint.\n";
+
+  test("never links a version whose model or variant is present but invalid", async () => {
+    // Present but invalid: not a string, empty, or longer than 256 characters.
+    // Absent (missing or undefined) leaves the version unconstrained.
+    for (const config of [
+      { model: { id: "model-1" } },
+      { model: 1 },
+      { model: "" },
+      { model: null },
+      { model: `${MODEL_REF}${"x".repeat(257 - MODEL_REF.length)}` },
+      { variant: ["high"] },
+      { variant: 0 },
+      { variant: "" },
+      { variant: "v".repeat(257) },
+    ]) {
+      const { langfuse, warm } = createLinking();
+      langfuse.add("agents/reviewer", 1, {
+        prompt: BODY_VALID,
+        config: { model: MODEL_REF },
+      });
+      langfuse.add("agents/reviewer", 2, { prompt: BODY_A, config });
+
+      expect(await warm()).toEqual({
+        name: "agents/reviewer",
+        status: "no_match",
+      });
+    }
+  });
+
+  test("keeps a missing constraint, and an exact 256-character one, usable", async () => {
+    const variant = "v".repeat(256);
+    const { langfuse, warm, judge } = createLinking();
+    langfuse.add("agents/reviewer", 1, {
+      prompt: BODY_A,
+      config: { model: MODEL_REF, variant },
+    });
+    langfuse.add("agents/reviewer", 2, {
+      prompt: BODY_B,
+      config: { other: 1 },
+    });
+
+    expect(
+      await warm(undefined, {
+        agent: "reviewer",
+        model: { ...model, variant },
+      }),
+    ).toEqual({ name: "agents/reviewer", status: "matched", version: 1 });
+    expect(judge([BODY_B])).toEqual({
+      name: "agents/reviewer",
+      status: "matched",
+      version: 2,
+    });
+  });
+});
+
+describe("tracked prompt names", () => {
+  test("tracks at most 64 names and reports later names as unavailable without fetching", async () => {
+    const { langfuse, judge, warnings } = createLinking();
+    for (let index = 0; index < 64; index += 1) {
+      judge(undefined, { agent: `agent-${index.toString()}`, model });
+    }
+    await settle();
+    const listed = langfuse.listCalls().length;
+    expect(listed).toBe(64);
+
+    expect(judge(undefined, { agent: "agent-64", model })).toEqual({
+      name: "agents/agent-64",
+      status: "unavailable",
+    });
+    expect(judge(undefined, { agent: "agent-65", model })).toEqual({
+      name: "agents/agent-65",
+      status: "unavailable",
+    });
+    await settle();
+
+    expect(langfuse.listCalls()).toHaveLength(listed);
+    expect(
+      warnings.filter((warning) => warning.includes("64 prompt names")),
+    ).toEqual([
+      "[Langfuse prompt linking] more than 64 prompt names; further names are not linked",
+    ]);
+    expect(judge(undefined, { agent: "agent-0", model })).toEqual({
+      name: "agents/agent-0",
+      status: "not_registered",
     });
   });
 });

@@ -31,6 +31,8 @@ const MAX_VERSIONS = 200;
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_RESPONSE_BYTES = MAX_BODY_BYTES + 64 * 1024;
 const MAX_LIST_PAGES = 20;
+const MAX_CONSTRAINT_LENGTH = 256;
+const MAX_PROMPT_NAMES = 64;
 const LIST_PAGE_SIZE = 100;
 const PROMPT_REFERENCE_TAG = "@@@langfusePrompt:";
 
@@ -170,12 +172,22 @@ const decodeJson = <A, I>(schema: Schema.Schema<A, I>, text: string) => {
   return decoded.right;
 };
 
-const configString = (config: unknown, key: string) => {
+// Reads config.model or config.variant. A missing key leaves the version
+// unconstrained; a value that is present but not a usable string makes the
+// version unlinkable rather than unconstrained.
+const configConstraint = (config: unknown, key: string) => {
   const value: unknown =
     typeof config === "object" && config !== null
       ? Reflect.get(config, key)
       : undefined;
-  return typeof value === "string" ? value : undefined;
+  if (value === undefined) {
+    return { valid: true, value: undefined } as const;
+  }
+  return typeof value === "string" &&
+    value !== "" &&
+    value.length <= MAX_CONSTRAINT_LENGTH
+    ? ({ valid: true, value } as const)
+    : ({ valid: false } as const);
 };
 
 const readLimited = async (response: Response, limit: number) => {
@@ -218,6 +230,8 @@ export class PromptLinking {
   private activeRequests = 0;
   private ownerKey: string | undefined;
   private locked = false;
+  private warnedInvalidOptions = false;
+  private warnedNameLimit = false;
   private config: PromptLinkingConfig | undefined;
 
   constructor(input: {
@@ -253,7 +267,8 @@ export class PromptLinking {
    */
   register(options: unknown) {
     const parsed = parsePromptLinkingOptions(options);
-    if (parsed._tag === "Invalid") {
+    if (parsed._tag === "Invalid" && !this.warnedInvalidOptions) {
+      this.warnedInvalidOptions = true;
       this.warn(
         "[Langfuse prompt linking] invalid promptLinking options; prompt linking is disabled",
       );
@@ -316,6 +331,9 @@ export class PromptLinking {
       }
 
       const state = this.state(name);
+      if (state === undefined) {
+        return { name, status: "unavailable" };
+      }
       this.refresh(name, state, false);
       const snapshot = this.usableSnapshot(state);
       if (snapshot === undefined) {
@@ -392,17 +410,29 @@ export class PromptLinking {
 
     setTimeout(() => {
       for (const name of names) {
-        if (this.enabled) {
-          this.refresh(name, this.state(name), false);
+        const state = this.enabled ? this.state(name) : undefined;
+        if (state !== undefined) {
+          this.refresh(name, state, false);
         }
       }
     }, 0).unref();
   }
 
+  // Names are never evicted; past the limit new names are not tracked at all,
+  // so the memory held for snapshots stays bounded.
   private state(name: string) {
     const existing = this.prompts.get(name);
     if (existing) {
       return existing;
+    }
+    if (this.prompts.size >= MAX_PROMPT_NAMES) {
+      if (!this.warnedNameLimit) {
+        this.warnedNameLimit = true;
+        this.warn(
+          `[Langfuse prompt linking] more than ${MAX_PROMPT_NAMES.toString()} prompt names; further names are not linked`,
+        );
+      }
+      return undefined;
     }
     const created: PromptState = {
       failedSinceCompletion: false,
@@ -611,11 +641,17 @@ export class PromptLinking {
       return { kind: "excluded" };
     }
 
+    const model = configConstraint(prompt.config, "model");
+    const variant = configConstraint(prompt.config, "variant");
+    if (!model.valid || !variant.valid) {
+      return { kind: "excluded" };
+    }
+
     return {
       kind: "text",
       hash: hashText(prompt.prompt),
-      model: configString(prompt.config, "model"),
-      variant: configString(prompt.config, "variant"),
+      model: model.value,
+      variant: variant.value,
     };
   }
 
