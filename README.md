@@ -1,5 +1,14 @@
 # Langfuse OpenCode Plugin
 
+> [!NOTE]
+> This is `@mageyuki/opencode-observability-plugin`, an **unofficial fork** of
+> [`@langfuse/opencode-observability-plugin`](https://github.com/langfuse/opencode-observability-plugin)
+> that adds [prompt linking](#prompt-linking). It is not maintained or supported
+> by Langfuse. Use `@mageyuki/opencode-observability-plugin@0.5.2-mageyuki.1` in
+> place of `@langfuse/opencode-observability-plugin` in the examples below. See
+> [FORK.md](./FORK.md) for the upstream base, the version scheme and the
+> upstream status.
+
 OpenCode plugin that sends OpenCode session telemetry to Langfuse. It traces user turns, assistant generations, tool calls, retries, reasoning output, compaction output, and failed generation steps.
 
 ## Quick Start

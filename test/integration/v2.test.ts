@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 
-import CombinedPlugin from "@langfuse/opencode-observability-plugin";
-import LangfusePlugin from "@langfuse/opencode-observability-plugin/v2";
+import CombinedPlugin from "@mageyuki/opencode-observability-plugin";
+import LangfusePlugin from "@mageyuki/opencode-observability-plugin/v2";
 import { Schema } from "effect";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 

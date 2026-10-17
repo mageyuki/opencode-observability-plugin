@@ -1,7 +1,7 @@
 {
-  "name": "@langfuse/opencode-observability-plugin",
-  "version": "0.5.2",
-  "description": "OpenCode plugin that sends session telemetry to Langfuse.",
+  "name": "@mageyuki/opencode-observability-plugin",
+  "version": "0.5.2-mageyuki.1",
+  "description": "Unofficial fork of the Langfuse OpenCode plugin that also links generations to Langfuse prompt versions.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -23,12 +23,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/langfuse/opencode-observability-plugin.git"
+    "url": "git+https://github.com/mageyuki/opencode-observability-plugin.git"
   },
   "bugs": {
-    "url": "https://github.com/langfuse/opencode-observability-plugin/issues"
+    "url": "https://github.com/mageyuki/opencode-observability-plugin/issues"
   },
-  "homepage": "https://github.com/langfuse/opencode-observability-plugin#readme",
+  "homepage": "https://github.com/mageyuki/opencode-observability-plugin#readme",
   "keywords": [
     "langfuse",
     "opencode",
@@ -39,7 +39,9 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "FORK.md",
+    "CHANGELOG.md"
   ],
   "publishConfig": {
     "access": "public"

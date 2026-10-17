@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import type { IncomingHttpHeaders, Server } from "node:http";
 
 import { trace } from "@opentelemetry/api";
-import LangfusePlugin from "@langfuse/opencode-observability-plugin/v1";
+import LangfusePlugin from "@mageyuki/opencode-observability-plugin/v1";
 import { Schema } from "effect";
 import {
   afterAll,
