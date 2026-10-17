@@ -1,0 +1,134 @@
+{
+  "processors": [
+    "Object",
+    "Object",
+    "Object",
+    "LangfuseSpanProcessor",
+    "Object"
+  ],
+  "spans": [
+    {
+      "name": "opencode.message.user",
+      "parent": "opencode.turn",
+      "attributes": {
+        "langfuse.observation.type": "event",
+        "session.id": "session-1",
+        "langfuse.observation.input": "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Review the diff\"}]}]",
+        "langfuse.observation.metadata": "{\"messageID\":\"user-1\"}",
+        "langfuse.plugin.version": "<plugin-version>",
+        "langfuse.observation.metadata.opencodeVersion": "2.0.4",
+        "langfuse.user.id": "test-user",
+        "langfuse.environment": "integration-test",
+        "langfuse.internal.is_app_root": false
+      },
+      "status": {
+        "code": 0
+      },
+      "events": []
+    },
+    {
+      "name": "read",
+      "parent": "opencode.generation",
+      "attributes": {
+        "langfuse.observation.type": "tool",
+        "session.id": "session-1",
+        "langfuse.observation.input": "{\"path\":\"README.md\"}",
+        "langfuse.observation.metadata": "{\"callID\":\"call-1\",\"tool\":\"read\"}",
+        "langfuse.plugin.version": "<plugin-version>",
+        "langfuse.observation.metadata.opencodeVersion": "2.0.4",
+        "langfuse.user.id": "test-user",
+        "langfuse.environment": "integration-test",
+        "langfuse.internal.is_app_root": false,
+        "langfuse.observation.output": "{\"title\":\"read\",\"output\":\"readme\"}"
+      },
+      "status": {
+        "code": 0
+      },
+      "events": []
+    },
+    {
+      "name": "opencode.generation",
+      "parent": "opencode.turn",
+      "attributes": {
+        "langfuse.observation.type": "generation",
+        "session.id": "session-1",
+        "langfuse.observation.model.name": "model-1",
+        "langfuse.observation.input": "{\"system\":[{\"type\":\"text\",\"text\":\"You are the reviewer.\\nCheck every change.\"},{\"type\":\"text\",\"text\":\"Instructions from: /home/user/.config/opencode/AGENTS.md\\n# Policy\\n\"}],\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Review the diff\"}]}],\"tools\":[{\"name\":\"read\",\"description\":\"Read a file\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}]}",
+        "langfuse.observation.metadata": "{\"messageID\":\"assistant-1\",\"parentID\":\"user-1\",\"agent\":\"reviewer\",\"providerID\":\"provider-1\",\"mode\":\"reviewer\",\"finish\":\"tool-calls\",\"snapshot\":\"snapshot-1\"}",
+        "langfuse.plugin.version": "<plugin-version>",
+        "langfuse.observation.metadata.opencodeVersion": "2.0.4",
+        "langfuse.user.id": "test-user",
+        "langfuse.environment": "integration-test",
+        "langfuse.internal.is_app_root": false,
+        "langfuse.observation.output": "[{\"role\":\"assistant\",\"content\":\"Looks good\",\"thinking\":[{\"type\":\"thinking\",\"content\":\"Thinking\"}],\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}]}]",
+        "langfuse.observation.usage_details": "{\"input\":10,\"output\":5,\"reasoning\":1,\"cache_read\":2,\"cache_write\":3,\"total\":16}",
+        "langfuse.observation.cost_details": "{\"total\":0.01}"
+      },
+      "status": {
+        "code": 0
+      },
+      "events": []
+    },
+    {
+      "name": "opencode.generation.retry",
+      "parent": "opencode.generation",
+      "attributes": {
+        "langfuse.observation.type": "event",
+        "session.id": "session-1",
+        "langfuse.observation.output": "{\"message\":\"rate limited\"}",
+        "langfuse.observation.metadata": "{\"attempt\":1}",
+        "langfuse.plugin.version": "<plugin-version>",
+        "langfuse.observation.metadata.opencodeVersion": "2.0.4",
+        "langfuse.user.id": "test-user",
+        "langfuse.environment": "integration-test",
+        "langfuse.internal.is_app_root": false
+      },
+      "status": {
+        "code": 0
+      },
+      "events": []
+    },
+    {
+      "name": "opencode.generation",
+      "parent": "opencode.turn",
+      "attributes": {
+        "langfuse.observation.type": "generation",
+        "session.id": "session-1",
+        "langfuse.observation.model.name": "model-1",
+        "langfuse.observation.input": "{\"system\":[{\"type\":\"text\",\"text\":\"You are the reviewer.\\nCheck every change.\"},{\"type\":\"text\",\"text\":\"Instructions from: /home/user/.config/opencode/AGENTS.md\\n# Policy\\n\"}],\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Continue\"}]}],\"tools\":[{\"name\":\"read\",\"description\":\"Read a file\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}]}",
+        "langfuse.observation.metadata": "{\"agent\":\"reviewer\",\"providerID\":\"provider-1\",\"snapshot\":\"snapshot-2\"}",
+        "langfuse.plugin.version": "<plugin-version>",
+        "langfuse.observation.metadata.opencodeVersion": "2.0.4",
+        "langfuse.user.id": "test-user",
+        "langfuse.environment": "integration-test",
+        "langfuse.internal.is_app_root": false,
+        "langfuse.observation.output": "{\"error\":{\"message\":\"provider failed\"}}"
+      },
+      "status": {
+        "code": 2,
+        "message": "provider failed"
+      },
+      "events": ["exception"]
+    },
+    {
+      "name": "opencode.turn",
+      "parent": null,
+      "attributes": {
+        "langfuse.observation.type": "agent",
+        "langfuse.internal.is_app_root": true,
+        "session.id": "session-1",
+        "langfuse.observation.input": "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Review the diff\"}]}]",
+        "langfuse.observation.metadata": "{\"messageID\":\"user-1\"}",
+        "langfuse.plugin.version": "<plugin-version>",
+        "langfuse.observation.metadata.opencodeVersion": "2.0.4",
+        "langfuse.user.id": "test-user",
+        "langfuse.environment": "integration-test",
+        "langfuse.observation.output": "[{\"role\":\"assistant\",\"content\":\"Looks good\",\"thinking\":[{\"type\":\"thinking\",\"content\":\"Thinking\"}],\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}]}]"
+      },
+      "status": {
+        "code": 0
+      },
+      "events": []
+    }
+  ]
+}

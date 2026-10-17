@@ -62,6 +62,39 @@ export LANGFUSE_USER_ID="your-user-id"
 
 If both `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set, the plugin uses environment variables instead of reading the config file. Optional values can be supplied either way.
 
+## Prompt Linking
+
+The plugin can link each OpenCode 2 generation to the [Langfuse prompt](https://langfuse.com/docs/prompt-management/get-started) version that holds the agent's prompt. It is off unless you configure it with plugin options:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "@langfuse/opencode-observability-plugin@latest",
+      "options": {
+        "promptLinking": {
+          // Prompt name for each agent; {agent} is replaced by the agent name.
+          "agentPrompt": "agents/{agent}",
+          // Optional explicit names, preferred over agentPrompt. null skips an agent.
+          "agents": { "build": null },
+        },
+      },
+    },
+  ],
+}
+```
+
+How it works:
+
+- The plugin reads the prompt versions from the Prompt Management API (`/api/public/v2/prompts`) with the configured Langfuse credentials, so the key needs read access to prompts. Bodies are fetched with `resolve=false` and only their hashes are kept in memory.
+- A generation is linked only when one whole system part equals a version's text after converting CRLF to LF and trimming trailing whitespace. A part that merely contains or extends a version's text is not linked. When the version's `config.model` (`<providerID>/<modelID>`) or `config.variant` is set, it must match the generation as well. Among versions with identical text, model and variant the newest is linked; any other ambiguity leaves the generation unlinked.
+- Chat prompts and prompts that reference other prompts (`@@@langfusePrompt:`) are not linked.
+- Linked generations get `langfuse.observation.prompt.name` and `langfuse.observation.prompt.version`. Every judged generation also gets `promptLink` metadata with `name`, `status` (`matched`, `no_match`, `ambiguous`, `not_registered` or `unavailable`) and, when matched, `version`.
+- Tracing never waits for the prompt API. Versions are cached for 60 seconds and refreshed in the background; while the API is failing or slow, generations are left unlinked with status `unavailable`.
+- Options are fixed for the OpenCode process by the first plugin instance. If a re-created instance has different options, prompt linking stays off until OpenCode restarts.
+- Invalid `promptLinking` options log one warning and disable only prompt linking.
+- OpenCode 1 does not expose the system prompt to plugins, so prompt linking applies to OpenCode 2 only.
+
 ## Contributing
 
 See the [contributing guide](./CONTRIBUTING.md).

@@ -12,21 +12,33 @@ import {
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { Context as EffectContext, Effect } from "effect";
 
+import {
+  PROMPT_LINKING,
+  PromptLinking,
+  type PromptLinkResult,
+} from "./prompt-link.js";
 import { PLUGIN_VERSION } from "./version.js";
 
 export class LangfuseClient {
   readonly baseUrl: string;
   readonly forceFlush: Effect.Effect<void, unknown>;
+  // Plugin instances reach prompt linking through this marker only, so a
+  // client created by another build of the plugin is never asked to link.
+  readonly [PROMPT_LINKING]: PromptLinking;
   private readonly traceState: LangfuseTraceState;
+  private readonly promptLinking: PromptLinking;
 
   constructor(input: {
     baseUrl: string;
     traceState: LangfuseTraceState;
     forceFlush: Effect.Effect<void, unknown>;
+    promptLinking: PromptLinking;
   }) {
     this.baseUrl = input.baseUrl;
     this.traceState = input.traceState;
     this.forceFlush = input.forceFlush;
+    this.promptLinking = input.promptLinking;
+    this[PROMPT_LINKING] = input.promptLinking;
   }
 
   clearTraceState() {
@@ -357,6 +369,12 @@ export class LangfuseClient {
         },
         snapshot: input.snapshot ?? existingMessageStep.snapshot,
       };
+      const promptLink = this.judgePromptLink(
+        existingMessageStep.span,
+        updatedStep.promptLink,
+        updatedStep,
+        "start",
+      );
 
       existingMessageStep.span.setAttribute(
         "langfuse.observation.model.name",
@@ -369,6 +387,7 @@ export class LangfuseClient {
           providerID: updatedStep.model.providerID,
           variant: updatedStep.model.variant,
           snapshot: updatedStep.snapshot,
+          ...promptLink,
         }),
       );
       this.traceState.activeGenerationStepsByMessageId.set(
@@ -395,6 +414,12 @@ export class LangfuseClient {
         },
         snapshot: input.snapshot ?? existingStep.snapshot,
       };
+      const promptLink = this.judgePromptLink(
+        existingStep.span,
+        updatedStep.promptLink,
+        input,
+        "start",
+      );
 
       existingStep.span.setAttribute(
         "langfuse.observation.model.name",
@@ -407,6 +432,7 @@ export class LangfuseClient {
           providerID: input.model.providerID,
           variant: input.model.variant,
           snapshot: input.snapshot,
+          ...promptLink,
         }),
       );
       this.traceState.activeGenerationSteps.set(input.sessionID, updatedStep);
@@ -430,9 +456,16 @@ export class LangfuseClient {
       return;
     }
 
+    const stepPromptLink = this.capturePromptLink(input.sessionID);
     const generationInput = this.consumeGenerationInput(
       input.sessionID,
       input.assistantMessageID,
+    );
+    const promptLink = this.judgePromptLink(
+      undefined,
+      stepPromptLink,
+      input,
+      "start",
     );
 
     this.withTurnParent(input.sessionID, undefined, () => {
@@ -451,7 +484,9 @@ export class LangfuseClient {
             providerID: input.model.providerID,
             variant: input.model.variant,
             snapshot: input.snapshot,
+            ...promptLink,
           }),
+          ...promptAttributes(stepPromptLink?.result),
         },
         startTime: new Date(input.started),
       });
@@ -463,6 +498,7 @@ export class LangfuseClient {
         model: input.model,
         span,
         snapshot: input.snapshot,
+        promptLink: stepPromptLink,
       });
       if (messageID != null) {
         const step = this.traceState.activeGenerationSteps.get(input.sessionID);
@@ -728,6 +764,19 @@ export class LangfuseClient {
         : undefined);
 
     if (step) {
+      const promptLink = this.judgePromptLink(
+        step.span,
+        step.promptLink,
+        {
+          agent: input.agent ?? step.agent,
+          model: {
+            id: input.modelID,
+            providerID: input.providerID,
+            variant: step.model?.variant,
+          },
+        },
+        "end",
+      );
       step.span.setAttribute("langfuse.observation.model.name", input.modelID);
       step.span.setAttribute(
         "langfuse.observation.output",
@@ -761,6 +810,7 @@ export class LangfuseClient {
           finish: input.finish,
           variant: step.model?.variant,
           snapshot: step.snapshot,
+          ...promptLink,
         }),
       );
 
@@ -782,9 +832,19 @@ export class LangfuseClient {
       return;
     }
 
+    const stepPromptLink = this.capturePromptLink(input.sessionID);
     const generationInput = this.consumeGenerationInput(
       input.sessionID,
       input.messageID,
+    );
+    const promptLink = this.judgePromptLink(
+      undefined,
+      stepPromptLink,
+      {
+        agent: input.agent,
+        model: { id: input.modelID, providerID: input.providerID },
+      },
+      "start",
     );
 
     this.withTurnParent(input.sessionID, input.parentID, () => {
@@ -819,7 +879,9 @@ export class LangfuseClient {
             providerID: input.providerID,
             mode: input.mode,
             finish: input.finish,
+            ...promptLink,
           }),
+          ...promptAttributes(stepPromptLink?.result),
         },
         startTime: new Date(input.created),
       });
@@ -858,6 +920,12 @@ export class LangfuseClient {
         : activeStep;
 
     if (step) {
+      const promptLink = this.judgePromptLink(
+        step.span,
+        step.promptLink,
+        step,
+        "end",
+      );
       step.span.setAttribute(
         "langfuse.observation.output",
         JSON.stringify({ error: input.error }),
@@ -869,6 +937,7 @@ export class LangfuseClient {
           providerID: step.model?.providerID,
           variant: step.model?.variant,
           snapshot: step.snapshot,
+          ...promptLink,
         }),
       );
       step.span.setStatus({
@@ -1139,6 +1208,7 @@ export class LangfuseClient {
     }
 
     this.withTurnParent(sessionID, undefined, () => {
+      const promptLink = this.capturePromptLink(sessionID);
       const generationInput = this.consumeGenerationInput(sessionID);
       const span = this.traceState.tracer.startSpan("opencode.generation", {
         attributes: {
@@ -1155,9 +1225,50 @@ export class LangfuseClient {
       this.traceState.activeGenerationSteps.set(sessionID, {
         sessionID,
         span,
+        promptLink,
       });
       this.traceState.generationParentSpans.set(sessionID, span);
     });
+  }
+
+  // Keeps the hashes of the system parts that are about to be consumed as the
+  // generation input. Nothing is kept while prompt linking is disabled.
+  private capturePromptLink(sessionID: string): StepPromptLink | undefined {
+    const hashes = this.promptLinking.hashSystem(
+      this.traceState.generationInputSnapshotsBySession.get(sessionID),
+    );
+    return hashes === undefined ? undefined : { hashes, judgedAtEnd: false };
+  }
+
+  // Decides the link without waiting for the prompt API. A result that is not
+  // final yet (no usable snapshot, or no match) is judged once more when the
+  // step ends; a match adds the prompt attributes to the generation span.
+  private judgePromptLink(
+    span: ApiSpan | undefined,
+    link: StepPromptLink | undefined,
+    input: Pick<ActiveGenerationStep, "agent" | "model">,
+    phase: "start" | "end",
+  ) {
+    if (link === undefined) {
+      return {};
+    }
+
+    const status = link.result?.status;
+    const final =
+      status === "matched" ||
+      status === "ambiguous" ||
+      status === "not_registered";
+    if (!final && !(phase === "end" && link.judgedAtEnd)) {
+      link.judgedAtEnd = phase === "end";
+      link.result = this.promptLinking.judge({
+        hashes: link.hashes,
+        agent: input.agent,
+        model: input.model,
+      });
+      span?.setAttributes(promptAttributes(link.result));
+    }
+
+    return link.result === undefined ? {} : { promptLink: link.result };
   }
 
   private withTurnParent<T>(
@@ -1668,7 +1779,24 @@ export type ActiveGenerationStep = {
   };
   span: ApiSpan;
   snapshot?: string;
+  promptLink?: StepPromptLink;
 };
+
+// What the prompt link of one generation is judged from. The prompt text
+// itself is not kept, only the hashes of the system parts.
+type StepPromptLink = {
+  readonly hashes: readonly string[];
+  result?: PromptLinkResult;
+  judgedAtEnd: boolean;
+};
+
+const promptAttributes = (result: PromptLinkResult | undefined) =>
+  result?.status === "matched" && result.version !== undefined
+    ? {
+        "langfuse.observation.prompt.name": result.name,
+        "langfuse.observation.prompt.version": result.version,
+      }
+    : {};
 
 export class LangfuseClientService extends EffectContext.Tag(
   "LangfuseClientService",
@@ -1802,5 +1930,10 @@ export const createLangfuseClient = (input: {
       baseUrl: input.baseUrl,
       traceState,
       forceFlush: Effect.tryPromise(() => processor.forceFlush()),
+      promptLinking: new PromptLinking({
+        baseUrl: input.baseUrl,
+        publicKey: input.publicKey,
+        secretKey: input.secretKey,
+      }),
     });
   });

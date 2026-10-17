@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode/plugin";
 import { Effect } from "effect";
 
 import type { ToolDefinition } from "./langfuse.js";
+import { PROMPT_LINKING } from "./prompt-link.js";
 import { createLangfuseRuntime } from "./runtime.js";
 
 const LangfusePlugin = {
@@ -19,6 +20,19 @@ const LangfusePlugin = {
     );
     if (!langfuse) {
       return;
+    }
+
+    // Only a client built by this package carries the marker; a client that
+    // another build already shares in this process is used without linking.
+    const promptLinking: unknown = Reflect.get(langfuse, PROMPT_LINKING);
+    const options: unknown = ctx.options;
+    if (
+      typeof promptLinking === "object" &&
+      promptLinking !== null &&
+      "register" in promptLinking &&
+      typeof promptLinking.register === "function"
+    ) {
+      Reflect.apply(promptLinking.register, promptLinking, [options]);
     }
 
     const abort = new AbortController();
