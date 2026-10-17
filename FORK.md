@@ -34,6 +34,35 @@ Without `promptLinking` options the plugin sends the same spans as upstream
 (`langfuse.observability`), the tracer scope (`opencode-langfuse-plugin`), the
 entrypoints (`.`, `./v1`, `./v2`) and the span processors are unchanged.
 
+## Operational limits of prompt linking
+
+These are accepted for this release; the README section
+[Prompt Linking](./README.md#prompt-linking) is the user-facing description.
+
+- **Demand-driven refresh.** No timers keep the cache warm. A generation that
+  uses a prompt name refreshes it in the background once the cache is older
+  than 45 seconds. After more than 60 seconds without a generation for that
+  name, the next generation starts with a provisional `unavailable` and is
+  judged once more at step end.
+- **Provisional metadata.** The `promptLink` written at step start is replaced
+  at step end or failure. A generation span closed without a step end (the
+  plugin's `endActiveGenerationSteps`, for example when the session finishes
+  first) keeps the start value, which can be `unavailable`.
+- **Size limits.** At most 1 MiB of decoded prompt text (UTF-8 bytes) per
+  version and at most 1 MiB + 64 KiB per serialized API response; at most 200
+  versions per name. A prompt over these limits is recorded as `unavailable` in
+  a completed snapshot, not treated as a failure, so it is not retried with
+  backoff.
+- **Bounds on retained state.** Only hashes of prompt text are kept. A
+  `config.model` or `config.variant` that is present but not a non-empty string
+  of at most 256 characters makes that version unlinkable instead of
+  unconstrained. At most 64 prompt names are tracked per process, without
+  eviction; later names report `unavailable` without requests and log one
+  warning.
+- **Warnings.** Invalid `promptLinking` options warn once per process. Fetch
+  problems warn once per name and state change with an HTTP status or
+  `transport failure` only.
+
 ## Version scheme
 
 Versions are `<upstream version>-mageyuki.<N>`, starting at `N = 1` for each
