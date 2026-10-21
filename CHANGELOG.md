@@ -4,6 +4,26 @@ This changelog covers the unofficial `@mageyuki/opencode-observability-plugin`
 fork. For upstream changes see the
 [upstream releases](https://github.com/langfuse/opencode-observability-plugin/releases).
 
+## 0.5.2-mageyuki.3
+
+Based on upstream `v0.5.2` (`24389efd13decfb72e103950526669addcb245e8`).
+
+### Fixed
+
+- A fresh `npm install` of `0.5.2-mageyuki.1` or `.2` resolved
+  `@langfuse/otel@5.14.0`, whose peer range `>=0.202.0 <1.0.0` admits
+  `@opentelemetry/exporter-trace-otlp-http@0.300.0` and
+  `@opentelemetry/otlp-exporter-base@0.300.0` (OpenTelemetry JS 3.x, which
+  needs `@opentelemetry/api >=1.10.0 <1.11.0`). The plugin keeps
+  `@opentelemetry/api` at 1.9.x with the 2.x SDK packages, so loading failed
+  with `SyntaxError: ... '@opentelemetry/api' does not provide an export named
+'SeverityNumber'`. The package now declares both exporter packages as direct
+  dependencies with the range `>=0.202.0 <0.300.0` (still inside the
+  `@langfuse/otel` peer range), so installs resolve the OpenTelemetry 2.x
+  compatible line (`0.221.0` in the lockfile). No source change.
+- `0.5.2-mageyuki.2` is deprecated for this reason; use
+  `0.5.2-mageyuki.3` or later.
+
 ## 0.5.2-mageyuki.2
 
 Based on upstream `v0.5.2` (`24389efd13decfb72e103950526669addcb245e8`).
