@@ -17,6 +17,23 @@ import {
   PromptLinking,
   type PromptLinkResult,
 } from "./prompt-link.js";
+import { SessionVersionHistory } from "./prompt-version-history.js";
+import {
+  addToPromptVersionSummary,
+  buildPromptVersionValue,
+  combinePromptVersionValues,
+  emptyPromptVersionSummary,
+  instructionChanged,
+  promptVersionAttributes,
+  promptVersionStamp,
+  promptVersionSummaryValue,
+  scanInstruction,
+  unavailablePromptVersionAttributes,
+  type AgentsMdResult,
+  type InstructionScan,
+  type PromptVersionsConfig,
+  type TurnPromptVersionSummary,
+} from "./prompt-versions.js";
 import { PLUGIN_VERSION } from "./version.js";
 
 export class LangfuseClient {
@@ -27,21 +44,45 @@ export class LangfuseClient {
   readonly [PROMPT_LINKING]: PromptLinking;
   private readonly traceState: LangfuseTraceState;
   private readonly promptLinking: PromptLinking;
+  private readonly versionHistory: SessionVersionHistory;
+  private readonly promptVersionFault: (error: unknown) => void;
+  // Prompt version state of the open turns, by turn span ID. Constant size
+  // per turn; deleted when the turn is finalized or its session is cleared.
+  private readonly turnVersionSummaries = new Map<string, TurnVersionState>();
+  private readonly stampedTurnSpans = new WeakSet<ApiSpan>();
 
   constructor(input: {
     baseUrl: string;
     traceState: LangfuseTraceState;
     forceFlush: Effect.Effect<void, unknown>;
     promptLinking: PromptLinking;
+    versionHistory: SessionVersionHistory;
+    promptVersionFault: (error: unknown) => void;
   }) {
     this.baseUrl = input.baseUrl;
     this.traceState = input.traceState;
     this.forceFlush = input.forceFlush;
     this.promptLinking = input.promptLinking;
+    this.versionHistory = input.versionHistory;
+    this.promptVersionFault = input.promptVersionFault;
     this[PROMPT_LINKING] = input.promptLinking;
   }
 
+  /** Test-only, read-only view of the prompt version state. */
+  debugPromptVersionState() {
+    return {
+      turnSummaries: this.turnVersionSummaries.size,
+      maxDistinctReleases: Array.from(
+        this.turnVersionSummaries.values(),
+      ).reduce((max, state) => Math.max(max, state.summary.releases.length), 0),
+      pending: (sessionID: string) =>
+        this.versionHistory.debugSize(sessionID).pending,
+    };
+  }
+
   clearTraceState() {
+    this.versionHistory.clear();
+    this.turnVersionSummaries.clear();
     this.traceState.assistantParts.clear();
     this.traceState.abortedSessions.clear();
     this.traceState.tracedEventIds.clear();
@@ -63,6 +104,13 @@ export class LangfuseClient {
 
   clearSessionTraceState(sessionID: string) {
     const sessionMessageIds = new Set<string>();
+
+    this.versionHistory.drop(sessionID);
+    for (const [turnSpanID, state] of this.turnVersionSummaries) {
+      if (state.sessionID === sessionID) {
+        this.turnVersionSummaries.delete(turnSpanID);
+      }
+    }
 
     for (const [messageID, parts] of this.traceState.assistantParts) {
       if (
@@ -163,6 +211,7 @@ export class LangfuseClient {
         step.span.recordException({ message, name: error.name });
       }
 
+      this.finalizeGeneration(step);
       step.span.end();
     }
 
@@ -193,6 +242,7 @@ export class LangfuseClient {
         continue;
       }
 
+      this.finalizeTurn(observation);
       observation.span.end();
     }
 
@@ -375,6 +425,7 @@ export class LangfuseClient {
         updatedStep,
         "start",
       );
+      this.judgePromptVersion(updatedStep, "start");
 
       existingMessageStep.span.setAttribute(
         "langfuse.observation.model.name",
@@ -420,6 +471,7 @@ export class LangfuseClient {
         input,
         "start",
       );
+      this.judgePromptVersion(updatedStep, "start");
 
       existingStep.span.setAttribute(
         "langfuse.observation.model.name",
@@ -457,6 +509,7 @@ export class LangfuseClient {
     }
 
     const stepPromptLink = this.capturePromptLink(input.sessionID);
+    const stepPromptVersion = this.capturePromptVersion(input.sessionID);
     const generationInput = this.consumeGenerationInput(
       input.sessionID,
       input.assistantMessageID,
@@ -491,7 +544,7 @@ export class LangfuseClient {
         startTime: new Date(input.started),
       });
 
-      this.traceState.activeGenerationSteps.set(input.sessionID, {
+      const newStep: ActiveGenerationStep = {
         sessionID: input.sessionID,
         messageID,
         agent: input.agent,
@@ -499,7 +552,9 @@ export class LangfuseClient {
         span,
         snapshot: input.snapshot,
         promptLink: stepPromptLink,
-      });
+        promptVersion: stepPromptVersion,
+      };
+      this.traceState.activeGenerationSteps.set(input.sessionID, newStep);
       if (messageID != null) {
         const step = this.traceState.activeGenerationSteps.get(input.sessionID);
         if (step) {
@@ -508,6 +563,8 @@ export class LangfuseClient {
         }
       }
       this.traceState.generationParentSpans.set(input.sessionID, span);
+      this.beginPromptVersion(newStep, undefined);
+      this.judgePromptVersion(newStep, "start");
     });
   }
 
@@ -593,6 +650,7 @@ export class LangfuseClient {
     );
 
     if (previousTurn) {
+      this.finalizeTurn(previousTurn);
       previousTurn.span.end();
       this.traceState.latestTurnObservationsBySession.delete(input.sessionID);
     }
@@ -623,6 +681,7 @@ export class LangfuseClient {
       if (parentSpan) {
         span.setAttribute("langfuse.internal.is_app_root", false);
       }
+      this.openTurnVersion(input.sessionID, span);
 
       const observation = {
         span,
@@ -818,6 +877,7 @@ export class LangfuseClient {
         input.messageID,
         step.span,
       );
+      this.finalizeGeneration(step, input.agent ?? step.agent);
       step.span.end(new Date(input.completed));
       this.traceState.activeGenerationStepsByMessageId.delete(input.messageID);
 
@@ -833,6 +893,7 @@ export class LangfuseClient {
     }
 
     const stepPromptLink = this.capturePromptLink(input.sessionID);
+    const stepPromptVersion = this.capturePromptVersion(input.sessionID);
     const generationInput = this.consumeGenerationInput(
       input.sessionID,
       input.messageID,
@@ -885,6 +946,19 @@ export class LangfuseClient {
         },
         startTime: new Date(input.created),
       });
+
+      // Written after startSpan returned, so after every processor's onStart
+      // (LANGFUSE_RELEASE cannot override it), and determined once.
+      const oneShot = {
+        sessionID: input.sessionID,
+        span,
+        agent: input.agent,
+        model: { id: input.modelID, providerID: input.providerID },
+        promptLink: stepPromptLink,
+        promptVersion: stepPromptVersion,
+      };
+      this.beginPromptVersion(oneShot, input.parentID);
+      this.judgePromptVersion(oneShot, "end");
 
       this.traceState.generationParentSpans.set(input.sessionID, span);
       this.traceState.generationSpansByMessageId.set(input.messageID, span);
@@ -945,6 +1019,7 @@ export class LangfuseClient {
         message: input.error.message,
       });
       step.span.recordException(input.error);
+      this.finalizeGeneration(step);
       step.span.end(new Date(input.completed));
       const messageID = input.assistantMessageID ?? step.messageID;
       if (messageID != null) {
@@ -1020,6 +1095,7 @@ export class LangfuseClient {
       }
     }
 
+    this.finalizeTurn(turn);
     turn.span.end();
 
     if (turn.messageID != null) {
@@ -1209,6 +1285,7 @@ export class LangfuseClient {
 
     this.withTurnParent(sessionID, undefined, () => {
       const promptLink = this.capturePromptLink(sessionID);
+      const promptVersion = this.capturePromptVersion(sessionID);
       const generationInput = this.consumeGenerationInput(sessionID);
       const span = this.traceState.tracer.startSpan("opencode.generation", {
         attributes: {
@@ -1222,12 +1299,16 @@ export class LangfuseClient {
         },
       });
 
-      this.traceState.activeGenerationSteps.set(sessionID, {
+      const step: ActiveGenerationStep = {
         sessionID,
         span,
         promptLink,
-      });
+        promptVersion,
+      };
+      this.traceState.activeGenerationSteps.set(sessionID, step);
       this.traceState.generationParentSpans.set(sessionID, span);
+      // Judged when a step adopts the span, or when it ends.
+      this.beginPromptVersion(step, undefined);
     });
   }
 
@@ -1269,6 +1350,235 @@ export class LangfuseClient {
     }
 
     return link.result === undefined ? {} : { promptLink: link.result };
+  }
+
+  // Keeps only the scan result of the instruction block, never its text.
+  private capturePromptVersion(
+    sessionID: string,
+  ): StepPromptVersion | undefined {
+    const config = this.promptLinking.versionsConfig;
+    if (config === undefined) {
+      return undefined;
+    }
+    try {
+      const snapshot =
+        this.traceState.generationInputSnapshotsBySession.get(sessionID);
+      const field = (key: string): unknown =>
+        typeof snapshot === "object" && snapshot !== null
+          ? Reflect.get(snapshot, key)
+          : undefined;
+      return {
+        scan: scanInstruction(field("system"), config.instructionPath),
+        changed: instructionChanged(field("messages"), config.instructionPath),
+        stamped: false,
+      };
+    } catch (error) {
+      this.promptVersionFault(error);
+      return undefined;
+    }
+  }
+
+  private openTurnVersion(sessionID: string, span: ApiSpan) {
+    if (this.promptLinking.versionsConfig === undefined) {
+      return;
+    }
+    try {
+      this.turnVersionSummaries.set(span.spanContext().spanId, {
+        sessionID,
+        startMs: Date.now(),
+        summary: emptyPromptVersionSummary(),
+      });
+    } catch (error) {
+      this.promptVersionFault(error);
+    }
+  }
+
+  // A generation entry exists from its span's start until its value is final;
+  // until then, windows of its session are undecided.
+  private beginPromptVersion(
+    step: PromptVersionStep,
+    turnMessageID: string | undefined,
+  ) {
+    const version = step.promptVersion;
+    if (version === undefined) {
+      return;
+    }
+    try {
+      version.entryId = step.span.spanContext().spanId;
+      version.turnSpanId = this.getTurnObservation(
+        step.sessionID,
+        turnMessageID,
+      )?.span.spanContext().spanId;
+      this.versionHistory.begin(step.sessionID, version.entryId);
+    } catch (error) {
+      version.stamped = true;
+      this.promptVersionFault(error);
+    }
+  }
+
+  // Determines the generation's value. At start it is used only when nothing
+  // can change it later; at the end it is used whatever it is. The span gets
+  // it exactly once.
+  private judgePromptVersion(
+    step: PromptVersionStep,
+    phase: "start" | "end",
+    agent = step.agent,
+  ) {
+    const version = step.promptVersion;
+    if (
+      version === undefined ||
+      version.stamped ||
+      version.entryId === undefined
+    ) {
+      return;
+    }
+    const entryId = version.entryId;
+
+    try {
+      const config = this.promptLinking.versionsConfig;
+      if (config === undefined) {
+        version.stamped = true;
+        this.versionHistory.abandon(step.sessionID, entryId);
+        return;
+      }
+
+      // Linking can be turned off for the process after the step started; a
+      // link result from before that is not used then (spec D6).
+      const linkingEnabled =
+        step.promptLink !== undefined && this.promptLinking.linkingEnabled;
+      const agentsMd: AgentsMdResult =
+        version.scan.status === "found"
+          ? this.promptLinking.lookupInstruction(
+              config.instructionPrompt,
+              version.scan.hash,
+            )
+          : { status: version.scan.status };
+      const value = buildPromptVersionValue({
+        prompt: config.instructionPrompt,
+        agentsMd,
+        changed: version.changed,
+        otherCount: version.scan.otherCount,
+        agent,
+        link: linkingEnabled
+          ? this.agentPromptLink(step, phase, agent)
+          : undefined,
+        linkingEnabled,
+      });
+      if (
+        phase === "start" &&
+        !(
+          FINAL_AGENTS_MD.has(value.agentsMdStatus) &&
+          (value.agentPromptStatus === undefined ||
+            FINAL_AGENT_PROMPT.has(value.agentPromptStatus))
+        )
+      ) {
+        return;
+      }
+
+      version.stamped = true;
+      promptVersionStamp.write(step.span, promptVersionAttributes(value));
+      this.versionHistory.finish(step.sessionID, entryId, value);
+      const turn =
+        version.turnSpanId === undefined
+          ? undefined
+          : this.turnVersionSummaries.get(version.turnSpanId);
+      if (turn !== undefined) {
+        addToPromptVersionSummary(turn.summary, value);
+      }
+    } catch (error) {
+      version.stamped = true;
+      try {
+        this.versionHistory.abandon(step.sessionID, entryId);
+      } catch {
+        // The fault below is reported once either way.
+      }
+      this.promptVersionFault(error);
+    }
+  }
+
+  // The agent prompt result for a prompt version. At the end, a result that
+  // is not final and was not judged at the end yet (bulk end, turn end,
+  // one-shot) is judged once more, for the prompt version only: the span's
+  // prompt link attributes and metadata stay as they are.
+  private agentPromptLink(
+    step: PromptVersionStep,
+    phase: "start" | "end",
+    agent: string | undefined,
+  ) {
+    const link = step.promptLink;
+    if (
+      link === undefined ||
+      phase === "start" ||
+      link.judgedAtEnd ||
+      (link.result !== undefined && FINAL_LINK.has(link.result.status))
+    ) {
+      return link?.result;
+    }
+    return this.promptLinking.judge({
+      hashes: link.hashes,
+      agent,
+      model: step.model,
+    });
+  }
+
+  private finalizeGeneration(step: ActiveGenerationStep, agent = step.agent) {
+    this.judgePromptVersion(step, "end", agent);
+  }
+
+  // Called right before a turn span ends, on every end path; idempotent.
+  private finalizeTurn(observation: TurnObservation) {
+    if (this.stampedTurnSpans.has(observation.span)) {
+      return;
+    }
+    this.stampedTurnSpans.add(observation.span);
+
+    let turnSpanID: string | undefined;
+    try {
+      turnSpanID = observation.span.spanContext().spanId;
+      const config = this.promptLinking.versionsConfig;
+      if (config === undefined) {
+        return;
+      }
+
+      for (const step of new Set([
+        ...this.traceState.activeGenerationSteps.values(),
+        ...this.traceState.activeGenerationStepsByMessageId.values(),
+      ])) {
+        if (
+          step.sessionID === observation.sessionID &&
+          step.promptVersion?.turnSpanId === turnSpanID
+        ) {
+          this.finalizeGeneration(step);
+        }
+      }
+
+      const state = this.turnVersionSummaries.get(turnSpanID);
+      if (state === undefined) {
+        return;
+      }
+      const value = promptVersionSummaryValue(
+        state.summary,
+        config.instructionPrompt,
+      );
+      const attributes =
+        value === undefined
+          ? historyAttributes(
+              this.versionHistory,
+              config,
+              observation.sessionID,
+              state.startMs,
+            )
+          : promptVersionAttributes(value);
+      if (attributes !== undefined) {
+        promptVersionStamp.write(observation.span, attributes);
+      }
+    } catch (error) {
+      this.promptVersionFault(error);
+    } finally {
+      if (turnSpanID !== undefined) {
+        this.turnVersionSummaries.delete(turnSpanID);
+      }
+    }
   }
 
   private withTurnParent<T>(
@@ -1780,6 +2090,89 @@ export type ActiveGenerationStep = {
   span: ApiSpan;
   snapshot?: string;
   promptLink?: StepPromptLink;
+  promptVersion?: StepPromptVersion;
+};
+
+// What the prompt version of one generation is determined from, held only by
+// its step. Only the scan result is kept, never the instruction text.
+type StepPromptVersion = {
+  entryId?: string;
+  turnSpanId?: string;
+  readonly scan: InstructionScan;
+  readonly changed: boolean;
+  stamped: boolean;
+};
+
+type PromptVersionStep = Pick<
+  ActiveGenerationStep,
+  "sessionID" | "span" | "agent" | "model" | "promptLink" | "promptVersion"
+>;
+
+type TurnVersionState = {
+  readonly sessionID: string;
+  readonly startMs: number;
+  readonly summary: TurnPromptVersionSummary;
+};
+
+// Start determinations that nothing later can change (spec D5).
+const FINAL_AGENTS_MD: ReadonlySet<string> = new Set([
+  "matched",
+  "absent",
+  "ambiguous",
+  "boundary_unknown",
+]);
+const FINAL_LINK: ReadonlySet<string> = new Set([
+  "matched",
+  "ambiguous",
+  "not_registered",
+]);
+const FINAL_AGENT_PROMPT: ReadonlySet<string> = new Set([
+  "matched",
+  "ambiguous",
+  "not_registered",
+  "disabled",
+]);
+
+// The attributes a span covering [fromMs, now] gets from the session history.
+const historyAttributes = (
+  history: SessionVersionHistory,
+  config: PromptVersionsConfig,
+  sessionID: string,
+  fromMs: number,
+) => {
+  const summary = history.summarize(sessionID, fromMs, Date.now());
+  switch (summary.kind) {
+    case "window": {
+      const value = combinePromptVersionValues(
+        summary.values,
+        config.instructionPrompt,
+      );
+      return value === undefined ? undefined : promptVersionAttributes(value);
+    }
+    case "latest":
+      return promptVersionAttributes(summary.value);
+    case "unavailable":
+      return unavailablePromptVersionAttributes;
+    case "none":
+      return undefined;
+  }
+};
+
+// One process-wide warning for internal errors of prompt versions. It names
+// the error type only: a message could quote instruction text.
+const createPromptVersionFault = () => {
+  let warned = false;
+  return (error: unknown) => {
+    if (warned) {
+      return;
+    }
+    warned = true;
+    console.warn(
+      `[Langfuse prompt versions] internal error (${
+        error instanceof Error ? error.name : typeof error
+      }); prompt version attributes skipped`,
+    );
+  };
 };
 
 // What the prompt link of one generation is judged from. The prompt text
@@ -1836,7 +2229,12 @@ const makeOpencodeVersionSpanProcessor = (version: string) =>
   }) satisfies SpanProcessor;
 
 // Langfuse's OTEL processor may auto-mark exported spans as app roots, this overrides that.
-const makeAppRootSpanProcessor = (tracerName: string) =>
+// It runs after LangfuseSpanProcessor, so the prompt versions it stamps on the
+// other spans of a session are not overridden by LANGFUSE_RELEASE.
+const makeAppRootSpanProcessor = (
+  tracerName: string,
+  stamp: (span: Span) => void,
+) =>
   ({
     onStart: (span: Span) => {
       if (span.instrumentationScope.name !== tracerName) {
@@ -1847,6 +2245,7 @@ const makeAppRootSpanProcessor = (tracerName: string) =>
         "langfuse.internal.is_app_root",
         span.name === "opencode.turn",
       );
+      stamp(span);
     },
     onEnd: () => undefined,
     shutdown: () => Promise.resolve(),
@@ -1890,6 +2289,47 @@ export const createLangfuseClient = (input: {
       pendingUserMessageIdsBySession: new Map<string, string>(),
     };
 
+    const promptLinking = new PromptLinking({
+      baseUrl: input.baseUrl,
+      publicKey: input.publicKey,
+      secretKey: input.secretKey,
+    });
+    const versionHistory = new SessionVersionHistory({
+      startedAtMs: Date.now(),
+      now: Date.now,
+    });
+    const promptVersionFault = createPromptVersionFault();
+    // Generations and turns are stamped by the client when their value is
+    // final; every other span of a session gets the value of its window.
+    const stampSessionSpan = (span: Span) => {
+      try {
+        const config = promptLinking.versionsConfig;
+        if (
+          config === undefined ||
+          span.name.startsWith("opencode.generation") ||
+          span.name.startsWith("opencode.turn")
+        ) {
+          return;
+        }
+        const sessionID = span.attributes["session.id"];
+        if (typeof sessionID !== "string") {
+          return;
+        }
+        const [seconds, nanoseconds] = span.startTime;
+        const attributes = historyAttributes(
+          versionHistory,
+          config,
+          sessionID,
+          seconds * 1000 + nanoseconds / 1e6,
+        );
+        if (attributes !== undefined) {
+          promptVersionStamp.write(span, attributes);
+        }
+      } catch (error) {
+        promptVersionFault(error);
+      }
+    };
+
     const processor = new LangfuseSpanProcessor({
       publicKey: input.publicKey,
       secretKey: input.secretKey,
@@ -1919,7 +2359,7 @@ export const createLangfuseClient = (input: {
           ? [makeUserIdSpanProcessor(input.userId)]
           : []),
         processor,
-        makeAppRootSpanProcessor(traceState.tracerName),
+        makeAppRootSpanProcessor(traceState.tracerName, stampSessionSpan),
       ],
     });
     yield* Effect.sync(() => {
@@ -1930,10 +2370,8 @@ export const createLangfuseClient = (input: {
       baseUrl: input.baseUrl,
       traceState,
       forceFlush: Effect.tryPromise(() => processor.forceFlush()),
-      promptLinking: new PromptLinking({
-        baseUrl: input.baseUrl,
-        publicKey: input.publicKey,
-        secretKey: input.secretKey,
-      }),
+      promptLinking,
+      versionHistory,
+      promptVersionFault,
     });
   });

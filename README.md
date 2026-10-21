@@ -107,6 +107,63 @@ How it works:
 - Invalid `promptLinking` options log one warning per OpenCode process and disable only prompt linking.
 - OpenCode 1 does not expose the system prompt to plugins, so prompt linking applies to OpenCode 2 only.
 
+## Prompt Versions
+
+The plugin can record which version of a global instruction file (`AGENTS.md`) and which agent prompt version each OpenCode 2 generation actually ran with, so scores can be grouped by version with the Langfuse Metrics API (`traceRelease`, `traceVersion`). It is off unless you configure it:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "@mageyuki/opencode-observability-plugin@0.5.2-mageyuki.2",
+      "options": {
+        "promptLinking": { "agentPrompt": "agents/{agent}" },
+        "promptVersions": {
+          "instructions": {
+            // The instruction file as OpenCode prints it in "Instructions from: <path>".
+            "path": "~/.config/opencode/AGENTS.md",
+            // The Langfuse prompt that holds the versions of that file.
+            "prompt": "policy/AGENTS",
+          },
+          "release": "instructions", // optional, the only accepted value
+          "version": "agentPrompt", // optional, the only accepted value
+        },
+      },
+    },
+  ],
+}
+```
+
+Options:
+
+| Input                                                           | Handling                                                                                                                                                                                                                                                                                       |
+| --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `promptVersions` absent or `null`                               | Off; the spans are the same as without the feature.                                                                                                                                                                                                                                            |
+| Not an object (`true`, a string, an array) or `{}`              | Invalid.                                                                                                                                                                                                                                                                                       |
+| Keys other than `instructions` (required), `release`, `version` | Invalid.                                                                                                                                                                                                                                                                                       |
+| `instructions`                                                  | An object with exactly `path` and `prompt`.                                                                                                                                                                                                                                                    |
+| `path`                                                          | A non-empty absolute path, or one starting with `~/` (replaced by the home directory). `~` alone, `~user/`, relative paths and `$VAR` are invalid. Only normalized paths are accepted: a `.` or `..` segment, an empty segment (`//`) or a trailing `/` is invalid. Symlinks are not resolved. |
+| `prompt`                                                        | 1 to 256 characters, without `{`, `}` or a newline. It must not be a name the same instance's `promptLinking` uses for agent prompts (an `agents` value, or a name the `agentPrompt` pattern matches).                                                                                         |
+| `release`, `version`                                            | `"instructions"` and `"agentPrompt"` only (the defaults).                                                                                                                                                                                                                                      |
+
+Invalid options log one warning (key names only) and disable only prompt versions; tracing and prompt linking continue. Options are fixed for the OpenCode process by the first plugin instance; a later instance with different (or missing, or invalid) `promptVersions` disables prompt versions until OpenCode restarts, without affecting prompt linking.
+
+Values:
+
+- `langfuse.release`: `policy/AGENTS@<N>` (the block equals version N), `policy/AGENTS#<sha12>` (an unregistered body, with the first 12 hex digits of its sha256), either followed by `+changed` when OpenCode reported that the file changed during the session, or `policy/AGENTS:mixed` when a turn or window holds more than one value. The prefix is the configured `prompt`.
+- `langfuse.version`: `agents/<name>@<N>` when prompt linking matched, otherwise the agent name (for example `build`), or `mixed`.
+- Metadata (`langfuse.observation.metadata.<key>`): `agentsMdVersion`, `agentsMdStatus` (`matched`, `no_match`, `absent`, `ambiguous`, `boundary_unknown`, `unavailable`, `mixed`), `agentsMdChanged`, `agentsMdSha12`, `agentPromptStatus` (`matched`, `not_registered`, `no_match`, `ambiguous`, `unavailable`, `disabled`, `mixed`), `otherInstructionCount` (other instruction blocks, counted only) and `promptVersionsSchema` (`1`). Every metadata value is written as a string (for example `"7"`, `"true"`), because the Langfuse SDK warns on export for non-string `langfuse.observation.metadata.*` attributes.
+- Only names, version numbers, a 12-hex hash prefix, statuses, booleans and counts are written; never instruction text or paths. When the value is unknown, `langfuse.release` is left unset and only the status is recorded.
+
+How it works and its limits:
+
+- The block of the configured path is found in the system prompt by its `Instructions from: <path>` header and ends at the first blank line followed by another header or the `Today's date:` line (the OpenCode v2.1.1 format). Without that terminator the status is `boundary_unknown` and no release is written. Its text, with CRLF converted to LF and trailing whitespace trimmed, is hashed and compared with the newest 50 versions of the prompt; the newest version with exactly that text wins. Versions whose text contains a blank line followed by `Instructions from: ` or `Today's date: ` are not indexed.
+- A change notice of OpenCode v2.1.1 for the configured path in the messages (`The instructions from <path> changed. Here's the diff:`, `… no longer apply.`, or `New instructions apply from:` followed by the path's block) marks the value `+changed`. If OpenCode changes these texts, changes are no longer detected and the session's starting version is recorded.
+- A generation is stamped once, when its value is final (at step start, or at step end at the latest). A turn is stamped right before it ends from its generations. Every other span with a `session.id` (tools, events, evaluation tasks) is stamped when it starts from the values determined inside its window `[start, now]`, or, if there are none, the last value before it. A window that starts before the OpenCode process started, before history that had to be dropped, or while a generation of the session is still undetermined gets only `agentsMdStatus=unavailable`.
+- The history is kept per session, so a subagent's generations do not count for its parent's spans. In the Metrics API a subagent turn's score is grouped by the trace root's (the parent's) values.
+- These attributes are written after the Langfuse span processor, so a `LANGFUSE_RELEASE` environment variable does not override them; spans that get no release keep the environment value.
+- The span processors are the same as without the feature. OpenCode 1 is not supported.
+
 ## Contributing
 
 See the [contributing guide](./CONTRIBUTING.md).
