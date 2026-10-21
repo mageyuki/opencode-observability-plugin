@@ -9,8 +9,9 @@ copyright notice in [LICENSE](./LICENSE) apply unchanged.
 
 - Upstream tag: `v0.5.2`
 - Upstream commit: `24389efd13decfb72e103950526669addcb245e8`
-- The lockfile is the upstream `v0.5.2` lockfile; build with
-  `pnpm install --frozen-lockfile`.
+- The lockfile is based on the upstream `v0.5.2` lockfile with this fork's
+  added direct dependency declarations (resolved versions otherwise kept);
+  build with `pnpm install --frozen-lockfile`.
 
 ## Changes from upstream
 
@@ -37,7 +38,20 @@ The fork keeps separate change sets on top of the upstream base:
    `test/integration/`. It builds on the prompt linking change set and is not
    proposed upstream yet (the upstream proposal is tracked in
    `mageyuki/opencode-config#202`).
-3. **Package identity**. Package name, version, description and repository
+3. **OpenTelemetry dependency range** (fix, `0.5.2-mageyuki.3`).
+   `@opentelemetry/exporter-trace-otlp-http` and
+   `@opentelemetry/otlp-exporter-base` are direct dependencies constrained to
+   `>=0.202.0 <0.300.0`. Upstream leaves them to the `@langfuse/otel` peer
+   range `>=0.202.0 <1.0.0`, which lets a fresh install pick the
+   OpenTelemetry JS 3.x line (`0.300.0`) that needs
+   `@opentelemetry/api >=1.10.0` and fails to load next to the 2.x SDK
+   packages. `0.5.2-mageyuki.1` and `.2` are affected; `.2` is deprecated. The
+   `knip` config ignores `otlp-exporter-base`, which no source file imports.
+   Drop the constraint only once `@langfuse/otel` supports the 3.x line and
+   the plugin's own OpenTelemetry SDK/resources/api dependencies (currently
+   `^2.x` / api `^1.9.1`) are migrated and verified compatible with the
+   OpenTelemetry JS 3.x line.
+4. **Package identity**. Package name, version, description and repository
    links, this file, [CHANGELOG.md](./CHANGELOG.md), the README notice and the
    package name used by the tests to import the built package.
 

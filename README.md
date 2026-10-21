@@ -4,7 +4,7 @@
 > This is `@mageyuki/opencode-observability-plugin`, an **unofficial fork** of
 > [`@langfuse/opencode-observability-plugin`](https://github.com/langfuse/opencode-observability-plugin)
 > that adds [prompt linking](#prompt-linking). It is not maintained or supported
-> by Langfuse. Use `@mageyuki/opencode-observability-plugin@0.5.2-mageyuki.1` in
+> by Langfuse. Use `@mageyuki/opencode-observability-plugin@0.5.2-mageyuki.3` in
 > place of `@langfuse/opencode-observability-plugin` in the examples below. See
 > [FORK.md](./FORK.md) for the upstream base, the version scheme and the
 > upstream status.
@@ -115,7 +115,7 @@ The plugin can record which version of a global instruction file (`AGENTS.md`) a
 {
   "plugins": [
     {
-      "package": "@mageyuki/opencode-observability-plugin@0.5.2-mageyuki.2",
+      "package": "@mageyuki/opencode-observability-plugin@0.5.2-mageyuki.3",
       "options": {
         "promptLinking": { "agentPrompt": "agents/{agent}" },
         "promptVersions": {
