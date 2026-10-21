@@ -14,7 +14,7 @@ copyright notice in [LICENSE](./LICENSE) apply unchanged.
 
 ## Changes from upstream
 
-The fork keeps two separate change sets on top of the upstream base:
+The fork keeps separate change sets on top of the upstream base:
 
 1. **Prompt linking** (feature). Opt-in linking of OpenCode 2 generations to
    Langfuse Prompt Management versions through the `promptLinking` plugin
@@ -25,12 +25,25 @@ The fork keeps two separate change sets on top of the upstream base:
    detects a shared client created by another build
    (`Symbol.for("langfuse.opencode.promptLinking.v1")`) exists only because the
    fork and upstream can share one process; an upstream port can drop it.
-2. **Package identity**. Package name, version, description and repository
+2. **Prompt versions** (feature, `0.5.2-mageyuki.2`). Opt-in attribution of
+   the loaded `AGENTS.md` version and agent prompt version to
+   `langfuse.release` / `langfuse.version` through the `promptVersions` plugin
+   option; see [Prompt Versions](./README.md#prompt-versions). It adds
+   `src/prompt-versions.ts` (option parsing, instruction scan, values and the
+   single attribute writer) and `src/prompt-version-history.ts` (per-session
+   history), adds the instruction prompt lookup and its owner rule to
+   `src/prompt-link.ts`, wires the end paths and the existing app-root
+   processor in `src/langfuse.ts`, and adds the README section and tests under
+   `test/integration/`. It builds on the prompt linking change set and is not
+   proposed upstream yet (the upstream proposal is tracked in
+   `mageyuki/opencode-config#202`).
+3. **Package identity**. Package name, version, description and repository
    links, this file, [CHANGELOG.md](./CHANGELOG.md), the README notice and the
    package name used by the tests to import the built package.
 
-Without `promptLinking` options the plugin sends the same spans as upstream
-`v0.5.2`; only the `langfuse.plugin.version` attribute differs. The plugin id
+Without `promptLinking` and `promptVersions` options the plugin sends the same
+spans as upstream `v0.5.2`; only the `langfuse.plugin.version` attribute
+differs. The plugin id
 (`langfuse.observability`), the tracer scope (`opencode-langfuse-plugin`), the
 entrypoints (`.`, `./v1`, `./v2`) and the span processors are unchanged.
 

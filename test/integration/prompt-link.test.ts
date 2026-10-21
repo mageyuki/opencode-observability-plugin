@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { PromptLinking } from "../../src/prompt-link.js";
@@ -834,5 +836,240 @@ describe("snapshot freshness and failures", () => {
       version: 2,
     });
     expect(langfuse.bodyCalls()).toHaveLength(2);
+  });
+});
+
+const INSTRUCTION = "policy/AGENTS";
+const PV = {
+  instructions: { path: "~/.config/opencode/AGENTS.md", prompt: INSTRUCTION },
+};
+const sha256 = (text: string) =>
+  createHash("sha256").update(text).digest("hex");
+
+const createVersions = (options: unknown = { promptVersions: PV }) => {
+  const langfuse = createLangfuse();
+  const clock = { now: 1_000_000 };
+  const warnings: string[] = [];
+  const linking = new PromptLinking({
+    baseUrl: BASE_URL,
+    publicKey: PUBLIC_KEY,
+    secretKey: SECRET_KEY,
+    fetch: langfuse.fetch,
+    now: () => clock.now,
+    warn: (message) => {
+      warnings.push(message);
+    },
+  });
+  linking.register(options, "/h");
+
+  const lookup = (body: string) =>
+    linking.lookupInstruction(INSTRUCTION, sha256(body));
+  // The first lookup starts the snapshot; the next one sees it.
+  const warm = async (body: string) => {
+    lookup(body);
+    await settle();
+    return lookup(body);
+  };
+
+  return { langfuse, clock, warnings, linking, lookup, warm };
+};
+
+describe("instruction prompt lookup", () => {
+  test("registers policy/AGENTS and prefetches it when only promptVersions is given", async () => {
+    const { langfuse, linking } = createVersions();
+
+    expect(linking.linkingEnabled).toBe(false);
+    expect(linking.versionsConfig).toMatchObject({
+      instructionPath: "/h/.config/opencode/AGENTS.md",
+      instructionPrompt: INSTRUCTION,
+    });
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 5);
+    });
+    await settle();
+    expect(langfuse.listCalls().map((call) => call.url.search)).toEqual([
+      "?name=policy%2FAGENTS&page=1&limit=100",
+    ]);
+  });
+
+  test("matches the newest of identical bodies", async () => {
+    const { langfuse, warm } = createVersions();
+    langfuse.add(INSTRUCTION, 3, { prompt: "# A" });
+    langfuse.add(INSTRUCTION, 4, { prompt: "# B" });
+    langfuse.add(INSTRUCTION, 5, { prompt: "# A" });
+
+    expect(await warm("# A")).toEqual({
+      status: "matched",
+      version: 5,
+      hash: sha256("# A"),
+    });
+  });
+
+  test("reports no_match for an unregistered body even when a registered prefix exists", async () => {
+    const { langfuse, warm } = createVersions();
+    langfuse.add(INSTRUCTION, 1, { prompt: "# P" });
+
+    expect(await warm("# P\nextra")).toEqual({
+      status: "no_match",
+      hash: sha256("# P\nextra"),
+    });
+  });
+
+  test("indexes only the newest 50 versions and stays usable past 200", async () => {
+    const { langfuse, warm, lookup } = createVersions();
+    for (let version = 1; version <= 230; version += 1) {
+      langfuse.add(INSTRUCTION, version, {
+        prompt: `# v${version.toString()}`,
+      });
+    }
+
+    expect(await warm("# v181")).toMatchObject({
+      status: "matched",
+      version: 181,
+    });
+    expect(lookup("# v100").status).toBe("no_match");
+    const fetched = langfuse
+      .bodyCalls()
+      .map((call) => Number(call.url.searchParams.get("version")))
+      .sort((a, b) => a - b);
+    expect(new Set(fetched)).toEqual(
+      new Set(Array.from({ length: 50 }, (_, index) => 181 + index)),
+    );
+  });
+
+  test("ignores model and variant config for the instruction prompt", async () => {
+    const { langfuse, warm } = createVersions();
+    langfuse.add(INSTRUCTION, 1, {
+      prompt: "# A",
+      config: { model: "x/y", variant: "" },
+    });
+
+    expect((await warm("# A")).status).toBe("matched");
+  });
+
+  test("excludes versions whose body has the delimiter shape", async () => {
+    const { langfuse, warm, lookup } = createVersions();
+    langfuse.add(INSTRUCTION, 1, { prompt: "# A" });
+    langfuse.add(INSTRUCTION, 2, {
+      prompt: "# B\n\nInstructions from: /x",
+    });
+
+    expect((await warm("# A")).status).toBe("matched");
+    expect(lookup("# B\n\nInstructions from: /x").status).toBe("no_match");
+  });
+
+  test("follows the strict eligibility", async () => {
+    const { langfuse, warm, lookup, clock } = createVersions();
+    langfuse.add(INSTRUCTION, 1, { prompt: "# A" });
+    expect((await warm("# A")).status).toBe("matched");
+
+    langfuse.intercept(() => Promise.resolve(json(500, {})));
+    clock.now += 46_000;
+    lookup("# A");
+    await settle();
+    expect(lookup("# A")).toEqual({ status: "unavailable" });
+
+    langfuse.intercept(undefined);
+    clock.now += 10_000;
+    expect((await warm("# A")).status).toBe("matched");
+  });
+
+  test("is unavailable for another name or when promptVersions is off", () => {
+    const { linking } = createVersions({
+      promptLinking: { agentPrompt: "agents/{agent}" },
+    });
+    expect(linking.versionsConfig).toBeUndefined();
+    expect(linking.lookupInstruction(INSTRUCTION, sha256("# A"))).toEqual({
+      status: "unavailable",
+    });
+  });
+});
+
+describe("promptVersions owner", () => {
+  const LINK = { agentPrompt: "agents/{agent}" };
+
+  test("keeps promptVersions for the same options", () => {
+    const { linking, warnings } = createVersions({ promptVersions: PV });
+    linking.register({ promptVersions: PV }, "/h");
+
+    expect(linking.versionsConfig).toBeDefined();
+    expect(warnings).toEqual([]);
+  });
+
+  test.each([
+    ["invalid", { promptLinking: LINK, promptVersions: { instructions: {} } }],
+    ["absent", { promptLinking: LINK }],
+    [
+      "different",
+      {
+        promptLinking: LINK,
+        promptVersions: {
+          instructions: { path: "/x/AGENTS.md", prompt: INSTRUCTION },
+        },
+      },
+    ],
+  ])(
+    "disables only promptVersions when a later instance disagrees (%s)",
+    (_name, later) => {
+      const { linking, warnings } = createVersions({
+        promptLinking: LINK,
+        promptVersions: PV,
+      });
+      linking.register(later, "/h");
+
+      expect(linking.versionsConfig).toBeUndefined();
+      expect(linking.linkingEnabled).toBe(true);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("promptVersions");
+    },
+  );
+
+  test("keeps promptVersions when a later instance only changes agentPrompt without overlap", () => {
+    const { linking, warnings } = createVersions({
+      promptLinking: LINK,
+      promptVersions: PV,
+    });
+    linking.register(
+      { promptLinking: { agentPrompt: "x/{agent}" }, promptVersions: PV },
+      "/h",
+    );
+
+    expect(linking.linkingEnabled).toBe(false);
+    expect(linking.versionsConfig).toBeDefined();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("promptLinking");
+  });
+
+  test("disables promptVersions when a later instance's own agentPrompt overlaps", () => {
+    const { linking, warnings } = createVersions({
+      promptLinking: LINK,
+      promptVersions: PV,
+    });
+    linking.register(
+      { promptLinking: { agentPrompt: "policy/{agent}" }, promptVersions: PV },
+      "/h",
+    );
+
+    expect(linking.versionsConfig).toBeUndefined();
+    expect(linking.linkingEnabled).toBe(false);
+    expect(warnings).toHaveLength(2);
+    expect(
+      warnings.filter((warning) => warning.includes("promptVersions")),
+    ).toHaveLength(1);
+    expect(
+      warnings.filter((warning) => warning.includes("promptLinking")),
+    ).toHaveLength(1);
+  });
+
+  test("warns once for invalid promptVersions on the first instance and keeps linking", () => {
+    const { linking, warnings } = createVersions({
+      promptLinking: LINK,
+      promptVersions: { instructions: { path: "rel/a", prompt: INSTRUCTION } },
+    });
+
+    expect(linking.versionsConfig).toBeUndefined();
+    expect(linking.linkingEnabled).toBe(true);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).not.toContain("rel/a");
   });
 });

@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 
 import { Either, Schema } from "effect";
+
+import {
+  hasDelimiterShape,
+  parsePromptVersionsOptions,
+  type AgentsMdResult,
+  type PromptVersionsConfig,
+} from "./prompt-versions.js";
 
 /**
  * Links OpenCode generations to the Langfuse Prompt Management version whose
@@ -33,13 +41,16 @@ const MAX_RESPONSE_BYTES = MAX_BODY_BYTES + 64 * 1024;
 const MAX_LIST_PAGES = 20;
 const MAX_CONSTRAINT_LENGTH = 256;
 const MAX_PROMPT_NAMES = 64;
+// The instruction prompt changes often; old versions are not loaded by live
+// sessions, so only the newest ones are indexed.
+const INSTRUCTION_WINDOW = 50;
 const LIST_PAGE_SIZE = 100;
 const PROMPT_REFERENCE_TAG = "@@@langfusePrompt:";
 
 const normalizePromptText = (text: string) =>
   text.replace(/\r\n/g, "\n").trimEnd();
 
-const hashText = (text: string) =>
+export const hashText = (text: string) =>
   createHash("sha256").update(normalizePromptText(text)).digest("hex");
 
 const PromptLinkingOptionsSchema = Schema.Struct({
@@ -57,7 +68,7 @@ const decodePromptLinkingOptions = Schema.decodeUnknownEither(
   { onExcessProperty: "error" },
 );
 
-const parsePromptLinkingOptions = (options: unknown) => {
+export const parsePromptLinkingOptions = (options: unknown) => {
   const promptLinking: unknown =
     typeof options === "object" && options !== null
       ? Reflect.get(options, "promptLinking")
@@ -148,6 +159,15 @@ type PromptState = {
   reported?: string;
 };
 
+// How the versions of the instruction prompt are indexed: only the newest
+// `window` versions, without model/variant constraints, and without bodies
+// that `exclude` rejects. Agent prompts keep the default (every version,
+// constraints, 200-version limit).
+type IndexPolicy = {
+  readonly window: number;
+  readonly exclude: (text: string) => boolean;
+};
+
 class PromptFetchError extends Error {}
 
 const PromptListSchema = Schema.Struct({
@@ -233,6 +253,9 @@ export class PromptLinking {
   private warnedInvalidOptions = false;
   private warnedNameLimit = false;
   private config: PromptLinkingConfig | undefined;
+  private versionsOwnerKey: string | undefined;
+  private versionsLocked = false;
+  private versions: PromptVersionsConfig | undefined;
 
   constructor(input: {
     baseUrl: string;
@@ -259,13 +282,22 @@ export class PromptLinking {
     return this.config !== undefined;
   }
 
+  get linkingEnabled() {
+    return this.enabled;
+  }
+
+  get versionsConfig() {
+    return this.versions;
+  }
+
   /**
    * Records the options of a plugin instance. The client is shared by every
    * instance in the process and any of them may trace a given generation, so
    * the first options win and a disagreeing instance turns linking off until
    * OpenCode restarts.
    */
-  register(options: unknown) {
+  register(options: unknown, homeDir: string = homedir()) {
+    this.registerVersions(options, homeDir);
     const parsed = parsePromptLinkingOptions(options);
     if (parsed._tag === "Invalid" && !this.warnedInvalidOptions) {
       this.warnedInvalidOptions = true;
@@ -291,6 +323,86 @@ export class PromptLinking {
         "[Langfuse prompt linking] plugin instances disagree on promptLinking options; prompt linking is disabled until OpenCode restarts",
       );
     }
+  }
+
+  /**
+   * The same first-wins rule for promptVersions, with its own owner key: a
+   * disagreement turns off only prompt versions, never prompt linking.
+   */
+  private registerVersions(options: unknown, homeDir: string) {
+    const parsed = parsePromptVersionsOptions(options, homeDir);
+    const key =
+      parsed._tag === "Enabled"
+        ? parsed.key
+        : parsed._tag === "Invalid"
+          ? "invalid"
+          : "disabled";
+
+    if (this.versionsOwnerKey === undefined) {
+      this.versionsOwnerKey = key;
+      if (parsed._tag === "Invalid") {
+        this.warn(
+          `[Langfuse prompt versions] invalid promptVersions options (${parsed.reason}); prompt versions are disabled`,
+        );
+      }
+      if (parsed._tag === "Enabled") {
+        this.versions = parsed;
+        this.prefetchNames([parsed.instructionPrompt]);
+      }
+      return;
+    }
+
+    if (key !== this.versionsOwnerKey && !this.versionsLocked) {
+      this.versionsLocked = true;
+      this.versions = undefined;
+      this.warn(
+        "[Langfuse prompt versions] plugin instances disagree on promptVersions options; prompt versions are disabled until OpenCode restarts",
+      );
+    }
+  }
+
+  /**
+   * Resolves an instruction region hash to a version of the instruction
+   * prompt without waiting. The newest version with that exact body wins.
+   */
+  lookupInstruction(name: string, hash: string): AgentsMdResult {
+    try {
+      if (this.versions?.instructionPrompt !== name) {
+        return { status: "unavailable" };
+      }
+      const state = this.state(name);
+      if (state === undefined) {
+        return { status: "unavailable" };
+      }
+      this.refresh(name, state, false);
+      const snapshot = this.usableSnapshot(state);
+      if (snapshot === undefined || snapshot.kind === "unavailable") {
+        return { status: "unavailable" };
+      }
+      if (snapshot.kind === "absent") {
+        return { status: "no_match", hash };
+      }
+
+      const versions = (snapshot.index.get(hash) ?? []).map(
+        (entry) => entry.version,
+      );
+      if (versions.length === 0) {
+        this.refresh(name, state, true);
+        return { status: "no_match", hash };
+      }
+      return { status: "matched", version: Math.max(...versions), hash };
+    } catch {
+      return { status: "unavailable" };
+    }
+  }
+
+  private policy(name: string): IndexPolicy | undefined {
+    return this.versions?.instructionPrompt === name
+      ? {
+          window: INSTRUCTION_WINDOW,
+          exclude: hasDelimiterShape,
+        }
+      : undefined;
   }
 
   hashSystem(snapshot: unknown) {
@@ -418,6 +530,18 @@ export class PromptLinking {
     }, 0).unref();
   }
 
+  private prefetchNames(names: readonly string[]) {
+    setTimeout(() => {
+      for (const name of names) {
+        const state =
+          this.policy(name) === undefined ? undefined : this.state(name);
+        if (state !== undefined) {
+          this.refresh(name, state, false);
+        }
+      }
+    }, 0).unref();
+  }
+
   // Names are never evicted; past the limit new names are not tracked at all,
   // so the memory held for snapshots stays bounded.
   private state(name: string) {
@@ -526,10 +650,15 @@ export class PromptLinking {
     state: PromptState,
     signal: AbortSignal,
   ) {
-    const versions = await this.listVersions(name, signal);
-    if (versions === undefined || versions.length === 0) {
+    const policy = this.policy(name);
+    const listed = await this.listVersions(name, signal);
+    if (listed === undefined || listed.length === 0) {
       return { kind: "absent" } as const;
     }
+    const versions =
+      policy === undefined
+        ? listed
+        : [...listed].sort((a, b) => b - a).slice(0, policy.window);
     if (versions.length > MAX_VERSIONS) {
       return { kind: "unavailable", versions: new Map() } as const;
     }
@@ -544,7 +673,7 @@ export class PromptLinking {
         records.set(
           version,
           previous.get(version) ??
-            (await this.fetchVersion(name, version, signal)),
+            (await this.fetchVersion(name, version, signal, policy)),
         );
       }),
     );
@@ -610,6 +739,7 @@ export class PromptLinking {
     name: string,
     version: number,
     signal: AbortSignal,
+    policy: IndexPolicy | undefined,
   ): Promise<VersionRecord> {
     const query = new URLSearchParams({
       version: version.toString(),
@@ -639,6 +769,11 @@ export class PromptLinking {
     }
     if (prompt.prompt.includes(PROMPT_REFERENCE_TAG)) {
       return { kind: "excluded" };
+    }
+    if (policy !== undefined) {
+      return policy.exclude(normalizePromptText(prompt.prompt))
+        ? { kind: "excluded" }
+        : { kind: "text", hash: hashText(prompt.prompt) };
     }
 
     const model = configConstraint(prompt.config, "model");
