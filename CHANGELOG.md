@@ -4,6 +4,36 @@ This changelog covers the unofficial `@mageyuki/opencode-observability-plugin`
 fork. For upstream changes see the
 [upstream releases](https://github.com/langfuse/opencode-observability-plugin/releases).
 
+## 0.5.2-mageyuki.4
+
+Based on upstream `v0.5.2` (`24389efd13decfb72e103950526669addcb245e8`).
+
+### Fixed
+
+- In an OpenCode 2 server with several locations (directories or
+  worktrees), the disposal of an idle location ended the open turns,
+  generations and tools of sessions at the other locations and cleared the
+  prompt version history and parent session links of every session. Turns
+  were cut off early, evaluation tasks lost their `langfuse.release`, and
+  child sessions that continued later became root traces. A disposal now
+  ends and forgets only the sessions its plugin instance holds, and keeps
+  their version history and parent links. A late hook from a location that
+  a session moved away from is still traced but no longer takes the session
+  from the instance that holds it; run events of an instance while another
+  instance holds the session, and hooks and run events after a disposal,
+  are ignored.
+
+### Changed
+
+- With `promptVersions`, a window that has no value determined inside it or
+  before it (for example a session first seen after a restart) is stamped
+  `agentsMdStatus=unavailable` instead of getting no prompt version
+  attributes. This includes spans of a new session before its first
+  generation and turns without a determined generation; no release is
+  written for them, as before. A reset of the plugin's whole state makes the
+  windows that start before it `unavailable`.
+- Dependency ranges are the same as `0.5.2-mageyuki.3`.
+
 ## 0.5.2-mageyuki.3
 
 Based on upstream `v0.5.2` (`24389efd13decfb72e103950526669addcb245e8`).

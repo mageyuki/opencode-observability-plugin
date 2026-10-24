@@ -1,6 +1,6 @@
 {
   "name": "@mageyuki/opencode-observability-plugin",
-  "version": "0.5.2-mageyuki.3",
+  "version": "0.5.2-mageyuki.4",
   "description": "Unofficial fork of the Langfuse OpenCode plugin that also links generations to Langfuse prompt versions.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

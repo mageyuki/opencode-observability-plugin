@@ -34,7 +34,11 @@ import {
   type PromptVersionsConfig,
   type TurnPromptVersionSummary,
 } from "./prompt-versions.js";
+import { SESSION_HOLDS, SessionHoldTable } from "./session-holds.js";
 import { PLUGIN_VERSION } from "./version.js";
+
+// The same bound as the version history's sessions (spec D5).
+const MAX_SESSION_PARENTS = 2000;
 
 export class LangfuseClient {
   readonly baseUrl: string;
@@ -42,6 +46,9 @@ export class LangfuseClient {
   // Plugin instances reach prompt linking through this marker only, so a
   // client created by another build of the plugin is never asked to link.
   readonly [PROMPT_LINKING]: PromptLinking;
+  // Which plugin instance holds a session; a client of another build has
+  // none (spec D3, D7).
+  readonly [SESSION_HOLDS]: SessionHoldTable;
   private readonly traceState: LangfuseTraceState;
   private readonly promptLinking: PromptLinking;
   private readonly versionHistory: SessionVersionHistory;
@@ -50,6 +57,9 @@ export class LangfuseClient {
   // per turn; deleted when the turn is finalized or its session is cleared.
   private readonly turnVersionSummaries = new Map<string, TurnVersionState>();
   private readonly stampedTurnSpans = new WeakSet<ApiSpan>();
+  // The message, call, event and reasoning keys each session added to the
+  // trace state, so that forgetting a session reaches them (spec D5).
+  private readonly sessionKeys = new Map<string, SessionKeys>();
 
   constructor(input: {
     baseUrl: string;
@@ -66,6 +76,16 @@ export class LangfuseClient {
     this.versionHistory = input.versionHistory;
     this.promptVersionFault = input.promptVersionFault;
     this[PROMPT_LINKING] = input.promptLinking;
+    this[SESSION_HOLDS] = new SessionHoldTable({
+      end: (sessionID) => {
+        this.endActiveToolObservations(sessionID);
+        this.endActiveGenerationSteps(sessionID);
+        this.endActiveTurnObservations(sessionID);
+      },
+      forget: (sessionID, keepSessionFacts) => {
+        this.forgetSession(sessionID, { keepSessionFacts });
+      },
+    });
   }
 
   /** Test-only, read-only view of the prompt version state. */
@@ -80,8 +100,67 @@ export class LangfuseClient {
     };
   }
 
+  /**
+   * Test-only, read-only count of the state one session has in the client.
+   * `ids` are the message, call and event IDs the session used; they are
+   * looked up directly, independently of the client's own index.
+   */
+  debugSessionState(sessionID: string, ids: readonly string[] = []) {
+    const state = this.traceState;
+    const bySession = [
+      state.abortedSessions,
+      state.activeGenerationSteps,
+      state.generationParentSpans,
+      state.generationInputsBySession,
+      state.generationInputSnapshotsBySession,
+      state.toolResultSourceMessageIdsBySession,
+      state.latestTurnObservationsBySession,
+      state.sessionHistories,
+      state.pendingUserMessageIdsBySession,
+      this.sessionKeys,
+    ].filter((entries) => entries.has(sessionID)).length;
+    const byValue = [
+      ...state.activeToolObservations.values(),
+      ...state.activeGenerationStepsByMessageId.values(),
+      ...state.turnObservationsByMessageId.values(),
+      ...this.turnVersionSummaries.values(),
+      ...Array.from(state.assistantParts.values()).flatMap((parts) =>
+        Array.from(parts.values()),
+      ),
+    ].filter((entry) => entry.sessionID === sessionID).length;
+    const byID = ids.flatMap((id) =>
+      [
+        state.tracedMessageIds,
+        state.tracedGenerationIds,
+        state.tracedEventIds,
+        state.generationSpansByMessageId,
+        state.activeGenerationStepsByMessageId,
+        state.turnObservationsByMessageId,
+        state.assistantParts,
+        state.toolMessageIdsByCallId,
+        state.activeToolObservations,
+        state.finalizedToolCallIds,
+      ]
+        .filter((entries) => entries.has(id))
+        .concat(
+          state.tracedReasoningIds.has(`${sessionID}:${id}`)
+            ? [state.tracedReasoningIds]
+            : [],
+        ),
+    ).length;
+
+    return {
+      entries: bySession + byValue + byID,
+      historyRuns: this.versionHistory.debugSize(sessionID).runs,
+      parent: state.sessionParentIds.get(sessionID),
+      ...this[SESSION_HOLDS].debugSession(sessionID),
+    };
+  }
+
   clearTraceState() {
     this.versionHistory.clear();
+    this.sessionKeys.clear();
+    this[SESSION_HOLDS].clear();
     this.turnVersionSummaries.clear();
     this.traceState.assistantParts.clear();
     this.traceState.abortedSessions.clear();
@@ -102,10 +181,76 @@ export class LangfuseClient {
     this.traceState.pendingUserMessageIdsBySession.clear();
   }
 
+  // Clears what OpenCode 1 clears when a session goes idle; the
+  // deduplication sets of its message IDs stay (spec D5).
   clearSessionTraceState(sessionID: string) {
+    this.clearSessionMaps(sessionID, true);
+    this.sessionKeys.delete(sessionID);
+    this[SESSION_HOLDS].drop(sessionID, true);
+  }
+
+  /**
+   * Forgets everything the client keeps for a session. With
+   * `keepSessionFacts` (a disposal, spec D4), its version history, its link
+   * to its parent session and its current location stay, because they are
+   * still true when the session continues at another location.
+   */
+  forgetSession(sessionID: string, options: { keepSessionFacts: boolean }) {
+    this.clearSessionMaps(sessionID, !options.keepSessionFacts);
+    const state = this.traceState;
+    const keys = this.sessionKeys.get(sessionID);
+    this.sessionKeys.delete(sessionID);
+    for (const messageID of keys?.messages ?? []) {
+      state.tracedMessageIds.delete(messageID);
+      state.tracedGenerationIds.delete(messageID);
+      state.generationSpansByMessageId.delete(messageID);
+      state.activeGenerationStepsByMessageId.delete(messageID);
+      state.turnObservationsByMessageId.delete(messageID);
+      state.assistantParts.delete(messageID);
+    }
+    for (const callID of keys?.calls ?? []) {
+      state.toolMessageIdsByCallId.delete(callID);
+      state.activeToolObservations.delete(callID);
+      state.finalizedToolCallIds.delete(callID);
+    }
+    for (const eventID of keys?.events ?? []) {
+      state.tracedEventIds.delete(eventID);
+      state.tracedGenerationIds.delete(eventID);
+    }
+    for (const reasoningKey of keys?.reasoning ?? []) {
+      state.tracedReasoningIds.delete(reasoningKey);
+    }
+    for (const [callID, observation] of state.activeToolObservations) {
+      if (observation.sessionID === sessionID) {
+        state.activeToolObservations.delete(callID);
+      }
+    }
+    if (!options.keepSessionFacts) {
+      state.sessionParentIds.delete(sessionID);
+    }
+    this[SESSION_HOLDS].drop(sessionID, options.keepSessionFacts);
+  }
+
+  private indexKey(sessionID: string, kind: keyof SessionKeys, key: string) {
+    let keys = this.sessionKeys.get(sessionID);
+    if (keys === undefined) {
+      keys = {
+        messages: new Set(),
+        calls: new Set(),
+        events: new Set(),
+        reasoning: new Set(),
+      };
+      this.sessionKeys.set(sessionID, keys);
+    }
+    keys[kind].add(key);
+  }
+
+  private clearSessionMaps(sessionID: string, dropHistory: boolean) {
     const sessionMessageIds = new Set<string>();
 
-    this.versionHistory.drop(sessionID);
+    if (dropHistory) {
+      this.versionHistory.drop(sessionID);
+    }
     for (const [turnSpanID, state] of this.turnVersionSummaries) {
       if (state.sessionID === sessionID) {
         this.turnVersionSummaries.delete(turnSpanID);
@@ -186,6 +331,7 @@ export class LangfuseClient {
       observation.span.end();
       this.traceState.activeToolObservations.delete(callID);
       this.traceState.finalizedToolCallIds.add(callID);
+      this.indexKey(observation.sessionID, "calls", callID);
       this.traceState.toolMessageIdsByCallId.delete(callID);
     }
   }
@@ -266,10 +412,15 @@ export class LangfuseClient {
     parentSessionID?: string;
   }) {
     if (input.parentSessionID != null) {
-      this.traceState.sessionParentIds.set(
-        input.sessionID,
-        input.parentSessionID,
-      );
+      const parents = this.traceState.sessionParentIds;
+      parents.delete(input.sessionID);
+      parents.set(input.sessionID, input.parentSessionID);
+      for (const oldest of parents.keys()) {
+        if (parents.size <= MAX_SESSION_PARENTS) {
+          break;
+        }
+        parents.delete(oldest);
+      }
     } else {
       this.traceState.sessionParentIds.delete(input.sessionID);
     }
@@ -290,6 +441,7 @@ export class LangfuseClient {
     }
 
     this.traceState.tracedEventIds.add(input.id);
+    this.indexKey(input.sessionID, "events", input.id);
 
     const startEvent = () => {
       const span = this.traceState.tracer.startSpan(input.name, {
@@ -339,6 +491,7 @@ export class LangfuseClient {
     }
 
     this.traceState.tracedReasoningIds.add(reasoningTraceKey);
+    this.indexKey(input.sessionID, "reasoning", reasoningTraceKey);
 
     if (input.messageID == null) {
       return;
@@ -347,6 +500,7 @@ export class LangfuseClient {
     const parts =
       this.traceState.assistantParts.get(input.messageID) ??
       new Map<string, MessagePart>();
+    this.indexKey(input.sessionID, "messages", input.messageID);
     parts.set(input.reasoningID, {
       id: input.reasoningID,
       sessionID: input.sessionID,
@@ -393,6 +547,9 @@ export class LangfuseClient {
     snapshot?: string;
   }) {
     const messageID = input.assistantMessageID;
+    if (messageID != null) {
+      this.indexKey(input.sessionID, "messages", messageID);
+    }
     const existingMessageStep =
       messageID != null
         ? this.traceState.activeGenerationStepsByMessageId.get(messageID)
@@ -638,6 +795,7 @@ export class LangfuseClient {
     );
 
     if (input.messageID != null) {
+      this.indexKey(input.sessionID, "messages", input.messageID);
       this.traceState.tracedMessageIds.add(input.messageID);
       this.traceState.pendingUserMessageIdsBySession.set(
         input.sessionID,
@@ -742,9 +900,11 @@ export class LangfuseClient {
 
     parts.set(part.id, part);
     this.traceState.assistantParts.set(part.messageID, parts);
+    this.indexKey(part.sessionID, "messages", part.messageID);
 
     if (part.type === "tool") {
       this.traceState.toolMessageIdsByCallId.set(part.callID, part.messageID);
+      this.indexKey(part.sessionID, "calls", part.callID);
     }
   }
 
@@ -756,6 +916,8 @@ export class LangfuseClient {
     args: Record<string, unknown>;
   }) {
     this.traceState.toolMessageIdsByCallId.set(input.callID, input.messageID);
+    this.indexKey(input.sessionID, "calls", input.callID);
+    this.indexKey(input.sessionID, "messages", input.messageID);
 
     const parts =
       this.traceState.assistantParts.get(input.messageID) ??
@@ -802,6 +964,7 @@ export class LangfuseClient {
     }
 
     this.traceState.tracedGenerationIds.add(input.messageID);
+    this.indexKey(input.sessionID, "messages", input.messageID);
 
     const output = input.output ?? this.getAssistantMessage(input.messageID);
     const turn = this.getTurnObservation(input.sessionID, input.parentID);
@@ -978,6 +1141,7 @@ export class LangfuseClient {
     }
 
     this.traceState.tracedGenerationIds.add(input.id);
+    this.indexKey(input.sessionID, "events", input.id);
 
     const activeStep = this.traceState.activeGenerationSteps.get(
       input.sessionID,
@@ -1146,6 +1310,7 @@ export class LangfuseClient {
           sessionID: input.sessionID,
           tool: input.tool,
         });
+        this.indexKey(input.sessionID, "calls", input.callID);
       },
       input.messageID ??
         this.traceState.toolMessageIdsByCallId.get(input.callID),
@@ -1208,6 +1373,7 @@ export class LangfuseClient {
     });
     this.traceState.activeToolObservations.delete(input.callID);
     this.traceState.finalizedToolCallIds.add(input.callID);
+    this.indexKey(input.sessionID, "calls", input.callID);
     this.traceState.toolMessageIdsByCallId.delete(input.callID);
   }
 
@@ -1268,6 +1434,7 @@ export class LangfuseClient {
     });
     this.traceState.activeToolObservations.delete(input.callID);
     this.traceState.finalizedToolCallIds.add(input.callID);
+    this.indexKey(observation.sessionID, "calls", input.callID);
     this.traceState.toolMessageIdsByCallId.delete(input.callID);
   }
 
@@ -2108,6 +2275,13 @@ type PromptVersionStep = Pick<
   "sessionID" | "span" | "agent" | "model" | "promptLink" | "promptVersion"
 >;
 
+type SessionKeys = {
+  readonly messages: Set<string>;
+  readonly calls: Set<string>;
+  readonly events: Set<string>;
+  readonly reasoning: Set<string>;
+};
+
 type TurnVersionState = {
   readonly sessionID: string;
   readonly startMs: number;
@@ -2153,8 +2327,6 @@ const historyAttributes = (
       return promptVersionAttributes(summary.value);
     case "unavailable":
       return unavailablePromptVersionAttributes;
-    case "none":
-      return undefined;
   }
 };
 
