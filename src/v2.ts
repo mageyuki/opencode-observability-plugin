@@ -4,6 +4,21 @@ import { Effect } from "effect";
 import type { ToolDefinition } from "./langfuse.js";
 import { PROMPT_LINKING } from "./prompt-link.js";
 import { createLangfuseRuntime } from "./runtime.js";
+import { openSessionHolds } from "./session-holds.js";
+
+// The events of a run that this plugin applies; they come many times per
+// session and change its state (spec D3 R3).
+const RUN_EVENTS: ReadonlySet<string> = new Set([
+  "session.step.started",
+  "session.text.ended",
+  "session.reasoning.ended",
+  "session.step.ended",
+  "session.step.failed",
+  "session.retry.scheduled",
+  "session.execution.failed",
+  "session.execution.succeeded",
+  "session.execution.interrupted",
+]);
 
 const LangfusePlugin = {
   id: "langfuse.observability",
@@ -35,6 +50,27 @@ const LangfusePlugin = {
       Reflect.apply(promptLinking.register, promptLinking, [options]);
     }
 
+    // The sessions this instance holds in the shared client (spec D3). The
+    // context's type requires a location; it is read loosely because an
+    // older OpenCode or a test context may not have one.
+    const holds = openSessionHolds(langfuse, Reflect.get(ctx, "location"));
+    // Set first thing on disposal: OpenCode may still call a hook it took
+    // before the hook was disposed, and the event loop may still deliver an
+    // event. Hooks and run events do nothing afterwards; the one-time
+    // session facts are still recorded while the loop drains (spec D3 R1,
+    // rev5).
+    const instance = { disposed: false };
+    // A hook writes its content whoever holds the session, then moves the
+    // hold here if the session is at this location (R2).
+    const hook =
+      <Input extends { sessionID: string }>(handle: (input: Input) => void) =>
+      (input: Input) => {
+        if (instance.disposed) {
+          return;
+        }
+        handle(input);
+        holds?.hook(input.sessionID);
+      };
     const abort = new AbortController();
     const registrations: { dispose: () => Promise<void> }[] = [];
     const userMessageIDs = new Map<string, string>();
@@ -52,104 +88,116 @@ const LangfusePlugin = {
     >();
 
     registrations.push(
-      await ctx.session.hook("prompt", (input) => {
-        userMessageIDs.set(input.sessionID, input.messageID);
-        langfuse.traceUserPrompt({
-          sessionID: input.sessionID,
-          messageID: input.messageID,
-          content: [
-            { type: "text", text: input.prompt.text },
-            ...(input.prompt.files ?? []).map((file) => ({
-              type: "file",
-              filename: file.name,
-              url: file.uri,
-            })),
-            ...(input.prompt.agents ?? []).map((agent) => ({
-              type: "agent",
-              name: agent.name,
-            })),
-          ],
-        });
-      }),
+      await ctx.session.hook(
+        "prompt",
+        hook((input) => {
+          userMessageIDs.set(input.sessionID, input.messageID);
+          langfuse.traceUserPrompt({
+            sessionID: input.sessionID,
+            messageID: input.messageID,
+            content: [
+              { type: "text", text: input.prompt.text },
+              ...(input.prompt.files ?? []).map((file) => ({
+                type: "file",
+                filename: file.name,
+                url: file.uri,
+              })),
+              ...(input.prompt.agents ?? []).map((agent) => ({
+                type: "agent",
+                name: agent.name,
+              })),
+            ],
+          });
+        }),
+      ),
     );
 
     registrations.push(
-      await ctx.session.hook("context", (input) => {
-        const tools: ToolDefinition[] = Object.entries(input.tools).map(
-          ([name, tool]) => ({
-            name,
-            description: tool.description,
-            parameters: tool.input,
-          }),
-        );
-        langfuse.setGenerationInputSnapshot(input.sessionID, {
-          system: input.system,
-          messages: input.messages,
-          tools,
-        });
-      }),
+      await ctx.session.hook(
+        "context",
+        hook((input) => {
+          const tools: ToolDefinition[] = Object.entries(input.tools).map(
+            ([name, tool]) => ({
+              name,
+              description: tool.description,
+              parameters: tool.input,
+            }),
+          );
+          langfuse.setGenerationInputSnapshot(input.sessionID, {
+            system: input.system,
+            messages: input.messages,
+            tools,
+          });
+        }),
+      ),
     );
 
     registrations.push(
-      await ctx.tool.hook("execute.before", (input) => {
-        generationDetails.get(input.messageID)?.toolCalls.set(input.id, {
-          id: input.id,
-          name: input.tool,
-          arguments: JSON.stringify(input.input),
-        });
-        langfuse.rememberToolCall({
-          callID: input.id,
-          messageID: input.messageID,
-          sessionID: input.sessionID,
-          tool: input.tool,
-          args:
-            typeof input.input === "object" && input.input !== null
-              ? { ...input.input }
-              : {},
-        });
-        langfuse.traceToolStart({
-          sessionID: input.sessionID,
-          messageID: input.messageID,
-          callID: input.id,
-          tool: input.tool,
-          args: input.input,
-        });
-      }),
-    );
-
-    registrations.push(
-      await ctx.tool.hook("execute.after", (input) => {
-        if (input.status === "error") {
-          langfuse.traceToolError({
+      await ctx.tool.hook(
+        "execute.before",
+        hook((input) => {
+          generationDetails.get(input.messageID)?.toolCalls.set(input.id, {
+            id: input.id,
+            name: input.tool,
+            arguments: JSON.stringify(input.input),
+          });
+          langfuse.rememberToolCall({
+            callID: input.id,
+            messageID: input.messageID,
+            sessionID: input.sessionID,
+            tool: input.tool,
+            args:
+              typeof input.input === "object" && input.input !== null
+                ? { ...input.input }
+                : {},
+          });
+          langfuse.traceToolStart({
             sessionID: input.sessionID,
             messageID: input.messageID,
             callID: input.id,
             tool: input.tool,
             args: input.input,
-            error: input.error.message,
-            completed: Date.now(),
           });
-          return;
-        }
+        }),
+      ),
+    );
 
-        const content = input.result.content;
-        const output =
-          typeof content === "string"
-            ? content
-            : (content ?? [])
-                .filter((part) => part.type === "text")
-                .map((part) => part.text)
-                .join("\n\n");
-        langfuse.traceToolEnd({
-          sessionID: input.sessionID,
-          messageID: input.messageID,
-          callID: input.id,
-          tool: input.tool,
-          args: input.input,
-          title: input.tool,
-          output,
-        });
-      }),
+    registrations.push(
+      await ctx.tool.hook(
+        "execute.after",
+        hook((input) => {
+          if (input.status === "error") {
+            langfuse.traceToolError({
+              sessionID: input.sessionID,
+              messageID: input.messageID,
+              callID: input.id,
+              tool: input.tool,
+              args: input.input,
+              error: input.error.message,
+              completed: Date.now(),
+            });
+            return;
+          }
+
+          const content = input.result.content;
+          const output =
+            typeof content === "string"
+              ? content
+              : (content ?? [])
+                  .filter((part) => part.type === "text")
+                  .map((part) => part.text)
+                  .join("\n\n");
+          langfuse.traceToolEnd({
+            sessionID: input.sessionID,
+            messageID: input.messageID,
+            callID: input.id,
+            tool: input.tool,
+            args: input.input,
+            title: input.tool,
+            output,
+          });
+        }),
+      ),
     );
 
     const events = (async () => {
@@ -157,11 +205,53 @@ const LangfusePlugin = {
         for await (const event of ctx.event.subscribe({
           signal: abort.signal,
         })) {
+          // Facts that are told once are recorded whoever holds the session,
+          // also after the disposal started; they do not end or change any
+          // observation (spec D3 F, R4).
           if (event.type === "session.created") {
             langfuse.rememberSessionParent({
               sessionID: event.data.sessionID,
               parentSessionID: event.data.parentID,
             });
+            continue;
+          }
+
+          if (event.type === "session.moved") {
+            // Moves of a session are ordered by their durable sequence; read
+            // loosely so that an event without one cannot end this loop.
+            const durable: unknown = Reflect.get(event, "durable");
+            const seq: unknown =
+              typeof durable === "object" && durable !== null
+                ? Reflect.get(durable, "seq")
+                : undefined;
+            holds?.moved(
+              event.data.sessionID,
+              Reflect.get(event.data, "location"),
+              typeof seq === "number" ? seq : event.created,
+            );
+            continue;
+          }
+
+          if (event.type === "session.deleted") {
+            if (holds === undefined) {
+              langfuse.clearSessionTraceState(event.data.sessionID);
+            } else {
+              holds.deleted(event.data.sessionID);
+            }
+            continue;
+          }
+
+          // Any other event changes the session's state only on the instance
+          // that holds it; a late event of an instance the session left is
+          // dropped (R3).
+          if (
+            instance.disposed ||
+            !RUN_EVENTS.has(event.type) ||
+            ("sessionID" in event.data &&
+              typeof event.data.sessionID === "string" &&
+              holds?.event(event.data.sessionID) === false)
+          ) {
+            continue;
           }
 
           if (event.type === "session.step.started") {
@@ -290,10 +380,6 @@ const LangfusePlugin = {
             }
             await Effect.runPromise(langfuse.forceFlush);
           }
-
-          if (event.type === "session.deleted") {
-            langfuse.clearSessionTraceState(event.data.sessionID);
-          }
         }
       } catch (error) {
         if (!abort.signal.aborted) {
@@ -303,15 +389,17 @@ const LangfusePlugin = {
     })();
 
     return async () => {
+      instance.disposed = true;
+      holds?.close();
       abort.abort();
       await Promise.all(
         registrations.map((registration) => registration.dispose()),
       );
       await events;
-      langfuse.endActiveToolObservations();
-      langfuse.endActiveGenerationSteps();
-      langfuse.endActiveTurnObservations();
-      langfuse.clearTraceState();
+      // Ends and forgets only the sessions this instance holds: the client is
+      // shared with the instances of other locations (spec D4). A client
+      // without holds is only flushed (D7).
+      holds?.release();
       // The tracer provider is process-wide and cannot be registered twice,
       // so an instance disposal must not tear it down (see runtime.ts).
       await Effect.runPromise(langfuse.forceFlush);

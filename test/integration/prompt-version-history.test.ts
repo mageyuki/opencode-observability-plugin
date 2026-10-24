@@ -69,7 +69,9 @@ describe("SessionVersionHistory", () => {
       kind: "latest",
       value: A,
     });
-    expect(history.summarize("s", 5, 11)).toEqual({ kind: "none" });
+    // Nothing was determined in or before the window: the history cannot
+    // prove that no version applied then (spec D6 H2).
+    expect(history.summarize("s", 5, 11)).toEqual({ kind: "unavailable" });
   });
 
   test("is exact for a run spanning the window", () => {
@@ -185,7 +187,7 @@ describe("SessionVersionHistory", () => {
       kind: "window",
       values: [B],
     });
-    expect(history.summarize("s2", 35, 40)).toEqual({ kind: "none" });
+    expect(history.summarize("s2", 35, 40)).toEqual({ kind: "unavailable" });
   });
 
   test("keeps an evicted session undecided while its generation is unfinal", () => {
@@ -266,8 +268,34 @@ describe("SessionVersionHistory", () => {
     history.begin("s", "pending");
     history.drop("s");
 
-    expect(history.summarize("s", 0, 20)).toEqual({ kind: "none" });
+    expect(history.summarize("s", 0, 20)).toEqual({ kind: "unavailable" });
     expect(history.debugSize("s")).toEqual({ runs: 0, pending: 0 });
     expect(history.coverageCompleteSinceMs).toBe(0);
+  });
+
+  test("is unavailable for a session without a record", () => {
+    const { history, finishAt } = createHistory();
+    finishAt(10, A, "other");
+
+    expect(history.summarize("unknown", 5, 20)).toEqual({
+      kind: "unavailable",
+    });
+  });
+
+  test("a reset invalidates the windows that start before it", () => {
+    const { history, clock, finishAt } = createHistory();
+    finishAt(10, A);
+    clock.now = 20;
+    history.clear();
+    finishAt(30, B);
+
+    // @7 was determined inside [5, 40] but is gone: only @8 is left, which
+    // would hide the mix.
+    expect(history.summarize("s", 5, 40)).toEqual({ kind: "unavailable" });
+    expect(history.summarize("s", 20, 40)).toEqual({
+      kind: "window",
+      values: [B],
+    });
+    expect(history.coverageCompleteSinceMs).toBe(20);
   });
 });

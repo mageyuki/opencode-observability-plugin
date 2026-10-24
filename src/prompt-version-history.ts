@@ -30,8 +30,7 @@ type SessionRecord = {
 export type HistorySummary =
   | { readonly kind: "window"; readonly values: readonly PromptVersionValue[] }
   | { readonly kind: "latest"; readonly value: PromptVersionValue }
-  | { readonly kind: "unavailable" }
-  | { readonly kind: "none" };
+  | { readonly kind: "unavailable" };
 
 // Every field that reaches the attributes is part of a run's identity, so
 // folding equal values never hides a change.
@@ -210,7 +209,10 @@ export class SessionVersionHistory {
     this.evictedUnfinal.delete(sessionID);
   }
 
+  // A reset loses determinations of every session, so a window that starts
+  // before it can no longer be decided (spec D6 H1).
   clear() {
+    this.completeSinceMs = Math.max(this.completeSinceMs, this.now());
     this.sessions.clear();
     this.evictedUnfinal.clear();
     this.forgottenUnfinal = 0;
@@ -218,7 +220,9 @@ export class SessionVersionHistory {
 
   /**
    * The values determined in `[fromMs, toMs]`; if there are none, the last
-   * value determined before `fromMs`.
+   * value determined before `fromMs`. Without either the window is
+   * unavailable: a missing record (a session first seen after a restart,
+   * evicted, reset or deleted) does not prove that no version applied.
    */
   summarize(sessionID: string, fromMs: number, toMs: number): HistorySummary {
     if (fromMs < this.completeSinceMs) {
@@ -226,7 +230,7 @@ export class SessionVersionHistory {
     }
     const session = this.sessions.get(sessionID);
     if (session === undefined) {
-      return { kind: "none" };
+      return { kind: "unavailable" };
     }
     if (
       fromMs < session.coverageFromMs ||
@@ -249,7 +253,7 @@ export class SessionVersionHistory {
     }
     const before = session.runs.findLast((run) => run.lastMs < fromMs);
     return before === undefined
-      ? { kind: "none" }
+      ? { kind: "unavailable" }
       : { kind: "latest", value: before.value };
   }
 

@@ -54,10 +54,38 @@ The fork keeps separate change sets on top of the upstream base:
 4. **Package identity**. Package name, version, description and repository
    links, this file, [CHANGELOG.md](./CHANGELOG.md), the README notice and the
    package name used by the tests to import the built package.
+5. **Location-scoped cleanup** (fix, `0.5.2-mageyuki.4`). OpenCode 2 runs one
+   plugin instance per location (directory or worktree) and disposes an
+   instance when its location has been idle, while all instances of the
+   process share one client. Upstream's disposal ends every open observation
+   and clears the whole trace state, including the prompt version history and
+   the links of child sessions to their parents, so evicting one location cut
+   off the open turns of sessions running at other locations and left their
+   evaluation tasks without a release. Here the shared client records which
+   instance holds each session (`src/session-holds.ts`): a hook is always
+   traced and moves the hold to its instance when the instance is at the
+   session's current location (recorded from `session.moved`), and only the
+   holder applies run events. A session that nobody holds can be taken by any
+   instance, so a move lost in a disposal cannot strand it; the instance at
+   the recorded location takes it back at its first hook. A disposal ends
+   and forgets only the sessions its instance holds and keeps their version
+   history, parent link and location; `session.deleted` forgets everything
+   of the session. A window with no recorded history is
+   `agentsMdStatus=unavailable` instead of unstamped, and a reset of the whole
+   state invalidates the windows that start before it. It touches `src/v2.ts`,
+   `src/langfuse.ts`, `src/prompt-version-history.ts`, the README and the
+   tests under `test/integration/`. The OpenCode 1 entry (`src/v1.ts`) is
+   unchanged. Upstream has the same disposal behavior (as of `v0.6.0`); this
+   fix is not proposed upstream. The marker symbol
+   `Symbol.for("langfuse.opencode.sessionHolds.v1")` detects a shared client
+   created by another build, which has no holds; the plugin then only
+   flushes on disposal.
 
 Without `promptLinking` and `promptVersions` options the plugin sends the same
-spans as upstream `v0.5.2`; only the `langfuse.plugin.version` attribute
-differs. The plugin id
+spans as upstream `v0.5.2` in a process with one location; only the
+`langfuse.plugin.version` attribute differs. With several locations, the
+disposal of one location does not end the observations of sessions at other
+locations, which upstream does (change set 5). The plugin id
 (`langfuse.observability`), the tracer scope (`opencode-langfuse-plugin`), the
 entrypoints (`.`, `./v1`, `./v2`) and the span processors are unchanged.
 

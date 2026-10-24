@@ -70,6 +70,9 @@ describe("OpenCode 2 package entrypoint", () => {
   });
 
   test("finalizes and flushes failed executions", async () => {
+    // Events that arrive after the cleanup started are ignored, so the test
+    // waits until the plugin asked for the event after the last one.
+    let drained = false;
     const registration = { dispose: vi.fn(() => Promise.resolve()) };
     const contextInput: unknown = {
       app: { version: "2.0.4" },
@@ -113,6 +116,7 @@ describe("OpenCode 2 package entrypoint", () => {
                 },
               },
             };
+            drained = true;
           },
         }),
       },
@@ -126,6 +130,9 @@ describe("OpenCode 2 package entrypoint", () => {
 
     const cleanup = await SourcePlugin.setup(context);
     expect(cleanup).toBeTypeOf("function");
+    await vi.waitFor(() => {
+      expect(drained).toBe(true);
+    });
     await cleanup?.();
 
     expect(runtime.createLangfuseRuntime).toHaveBeenCalledWith({
@@ -167,6 +174,107 @@ describe("OpenCode 2 package entrypoint", () => {
 
     expect(runtime.createLangfuseRuntime).toHaveBeenCalledTimes(2);
     expect(runtime.forceFlush).toHaveBeenCalledTimes(2);
+  });
+
+  test("ignores an event that arrives after the cleanup started", async () => {
+    const registration = { dispose: vi.fn(() => Promise.resolve()) };
+    const contextInput: unknown = {
+      app: { version: "2.0.4" },
+      session: { hook: vi.fn(() => Promise.resolve(registration)) },
+      tool: { hook: vi.fn(() => Promise.resolve(registration)) },
+      event: {
+        subscribe: ({ signal }: { signal: AbortSignal }) => ({
+          async *[Symbol.asyncIterator]() {
+            await new Promise<void>((resolve) => {
+              signal.addEventListener(
+                "abort",
+                () => {
+                  resolve();
+                },
+                { once: true },
+              );
+            });
+            yield {
+              type: "session.step.started",
+              created: 100,
+              data: {
+                sessionID: "session-1",
+                assistantMessageID: "assistant-1",
+                agent: "build",
+                model: { id: "model-1", providerID: "provider-1" },
+                snapshot: "snapshot-1",
+              },
+            };
+          },
+        }),
+      },
+    };
+    const context = Schema.decodeUnknownSync(
+      Schema.declare(
+        (input): input is Parameters<typeof SourcePlugin.setup>[0] =>
+          typeof input === "object" && input !== null,
+      ),
+    )(contextInput);
+
+    const cleanup = await SourcePlugin.setup(context);
+    await cleanup?.();
+
+    expect(runtime.startActiveGenerationStep).not.toHaveBeenCalled();
+  });
+
+  test("still records one-time session facts that arrive after the cleanup started", async () => {
+    const registration = { dispose: vi.fn(() => Promise.resolve()) };
+    const contextInput: unknown = {
+      app: { version: "2.0.4" },
+      session: { hook: vi.fn(() => Promise.resolve(registration)) },
+      tool: { hook: vi.fn(() => Promise.resolve(registration)) },
+      event: {
+        subscribe: ({ signal }: { signal: AbortSignal }) => ({
+          async *[Symbol.asyncIterator]() {
+            await new Promise<void>((resolve) => {
+              signal.addEventListener(
+                "abort",
+                () => {
+                  resolve();
+                },
+                { once: true },
+              );
+            });
+            yield {
+              type: "session.created",
+              created: 100,
+              data: { sessionID: "child-1", parentID: "parent-1" },
+            };
+            yield {
+              type: "session.execution.succeeded",
+              created: 110,
+              data: { sessionID: "child-1" },
+            };
+            yield {
+              type: "session.deleted",
+              created: 120,
+              data: { sessionID: "session-2" },
+            };
+          },
+        }),
+      },
+    };
+    const context = Schema.decodeUnknownSync(
+      Schema.declare(
+        (input): input is Parameters<typeof SourcePlugin.setup>[0] =>
+          typeof input === "object" && input !== null,
+      ),
+    )(contextInput);
+
+    const cleanup = await SourcePlugin.setup(context);
+    await cleanup?.();
+
+    expect(runtime.rememberSessionParent).toHaveBeenCalledWith({
+      sessionID: "child-1",
+      parentSessionID: "parent-1",
+    });
+    expect(runtime.clearSessionTraceState).toHaveBeenCalledWith("session-2");
+    expect(runtime.endActiveTurnObservations).not.toHaveBeenCalled();
   });
 
   test("traces a complete session with prompt, text, reasoning, and tools", async () => {
